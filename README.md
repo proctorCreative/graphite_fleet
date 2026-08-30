@@ -2,6 +2,10 @@
 
 Graphite Fleet is an independent, noncommercial browser adaptation of a traditional pencil-and-paper space-combat game passed between classrooms and friends, professors and students. Thank you, Professor Armstrong.
 
+## Play Online
+
+https://proctorcreative.com/graphite_fleet/
+
 ## Run locally
 
 Requirements: Node.js 22.13 or newer.
