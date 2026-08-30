@@ -25,4 +25,4 @@ Upload the contents of `dist/` to your web server. Asset paths are relative, so 
 
 - The game is client-side and does not require a database or backend service.
 - The source release intentionally excludes the original hosted-Sites deployment identity and generated files.
-- No software license is included. Add the license or usage terms you want before inviting outside contributions or reuse.
+- MIT License
