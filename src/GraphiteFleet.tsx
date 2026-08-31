@@ -1,6 +1,5 @@
+"use client";
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-
-// Domain model
 type Vec = {
     x: number;
     y: number;
@@ -11,6 +10,8 @@ type ViewMode = "tactical" | "history";
 type ThemeMode = "dark";
 type OpponentMode = "human" | "cpu";
 type FleetSize = 3 | 6;
+type CpuDoctrine = "hunter" | "siege" | "screen" | "raider";
+type CpuShipRole = "striker" | "interceptor" | "escort";
 type GameSettings = {
     gravity: true;
     inertia: true;
@@ -167,6 +168,9 @@ type Game = {
         boolean,
         boolean
     ];
+    matchSeed: number;
+    initialAsteroids: Asteroid[];
+    cpuDoctrine: CpuDoctrine;
 };
 type Camera = {
     x: number;
@@ -235,7 +239,6 @@ type CpuChoice = {
     power: number;
     note: string;
 };
-// Simulation and presentation constants
 const WORLD_W = 3000;
 const WORLD_H = 2000;
 const INTERVAL = 6;
@@ -244,6 +247,7 @@ const STEPS = Math.round(INTERVAL / STEP);
 const MAX_VECTOR_INPUT = 420;
 const MAX_DV = 20;
 const TORPEDO_SPEED_SCALE = .75;
+const MAX_TORPEDO_AGE = INTERVAL * 6;
 const PAPER = "#eeeae0";
 const PAPER_2 = "#e7e1d4";
 const GRAPHITE = "#343638";
@@ -252,12 +256,12 @@ const DEFAULT_COLORS: [
     string
 ] = ["#2474a8", "#c65540"];
 const COLOR_OPTIONS = [
-    { name: "Teal", value: "#168b8b" }, { name: "Vermilion", value: "#c65540" },
+    { name: "Blue", value: "#2474a8" }, { name: "Vermilion", value: "#c65540" },
     { name: "Indigo", value: "#5967c8" }, { name: "Gold", value: "#a36f00" },
-    { name: "Plum", value: "#9a4b83" }, { name: "Blue", value: "#2474a8" },
+    { name: "Plum", value: "#9a4b83" }, { name: "Teal", value: "#168b8b" },
 ];
 const CENTRAL = { x: 1500, y: 1000, r: 180, mu: 820000 };
-const DEFAULT_SETTINGS: GameSettings = { gravity: true, inertia: true, fleetSize: 3, actionsPerCommander: 1, theme: "dark", opponent: "human", colors: [...DEFAULT_COLORS], historyOpacity: 2 };
+const PAPER_DEFAULTS: GameSettings = { gravity: true, inertia: true, fleetSize: 3, actionsPerCommander: 1, theme: "dark", opponent: "human", colors: [...DEFAULT_COLORS], historyOpacity: 2 };
 const HISTORY_LEVELS = [0, .22, .45, .68] as const;
 const HISTORY_LABELS = ["Off", "Faint", "Medium", "Full"] as const;
 // The former largest setting (1.3×) is now the midpoint. This makes the whole
@@ -265,14 +269,6 @@ const HISTORY_LABELS = ["Off", "Faint", "Medium", "Full"] as const;
 const UI_SCALE_VALUES = [1, 1.15, 1.3, 1.45, 1.6] as const;
 const UI_SCALE_LABELS = ["Compact", "Small", "Medium", "Large", "Extra large"] as const;
 const INITIAL_TELEMETRY: Telemetry = { speed: "9.0 u/s", consequence: "BOUND", periapsis: "—", closest: "—", vector: "Δv 9.0 u/s", impact: false };
-const ASTEROID_SEEDS: Asteroid[] = [
-    { id: "R1", orbitRadius: 540, phase: -Math.PI / 2, r: 28, direction: 1, alive: true, armor: 2 },
-    { id: "R2", orbitRadius: 540, phase: Math.PI / 2, r: 28, direction: 1, alive: true, armor: 2 },
-    { id: "R3", orbitRadius: 820, phase: -.82, r: 34, direction: 1, alive: true, armor: 2 },
-    { id: "R4", orbitRadius: 820, phase: Math.PI - .82, r: 34, direction: 1, alive: true, armor: 2 },
-    { id: "R5", orbitRadius: 680, phase: .22, r: 30, direction: 1, alive: true, armor: 2 },
-    { id: "R6", orbitRadius: 680, phase: Math.PI + .22, r: 30, direction: 1, alive: true, armor: 2 },
-];
 const cloneVec = (v: Vec): Vec => ({ x: v.x, y: v.y });
 const add = (a: Vec, b: Vec): Vec => ({ x: a.x + b.x, y: a.y + b.y });
 const sub = (a: Vec, b: Vec): Vec => ({ x: a.x - b.x, y: a.y - b.y });
@@ -297,7 +293,41 @@ const hash01 = (text: string) => { let h = 2166136261; for (let i = 0; i < text.
     h = Math.imul(h, 16777619);
 } return (h >>> 0) / 4294967295; };
 const resolutionMotionProgress = (resolution: Resolution) => clamp((resolution.progress - resolution.lead) / Math.max(.001, 1 - resolution.lead), 0, 1);
-// Shared destruction effect for bases, ships, and asteroids.
+const generateMatchSeed = () => ((Date.now() ^ Math.floor(performance.now() * 1000)) >>> 0) % 1000000 || 1;
+function asteroidLayout(matchSeed: number): Asteroid[] {
+    // Each belt keeps a matched pair moving together, preventing same-orbit
+    // head-on collisions while allowing the three belts to counter-rotate.
+    const directionPatterns: [
+        1 | -1,
+        1 | -1,
+        1 | -1
+    ][] = [
+        [1, 1, 1], [1, -1, 1], [-1, 1, -1], [1, 1, -1], [-1, -1, 1], [-1, 1, 1],
+    ];
+    const pattern = directionPatterns[Math.floor(hash01(`${matchSeed}:belt-pattern`) * directionPatterns.length) % directionPatterns.length];
+    const rings = [540, 680, 820];
+    return rings.flatMap((orbitRadius, belt) => {
+        const phase = hash01(`${matchSeed}:belt-${belt}:phase`) * Math.PI * 2;
+        const radius = [28, 30, 34][belt];
+        return [0, 1].map((side) => ({
+            id: `R${belt * 2 + side + 1}`,
+            orbitRadius,
+            phase: phase + side * Math.PI,
+            r: radius,
+            direction: pattern[belt],
+            alive: true,
+            armor: 2,
+        }));
+    });
+}
+function doctrineForSeed(matchSeed: number): CpuDoctrine {
+    const doctrines: CpuDoctrine[] = ["hunter", "siege", "screen", "raider"];
+    return doctrines[Math.floor(hash01(`${matchSeed}:cpu-doctrine`) * doctrines.length) % doctrines.length];
+}
+function shipRoleFor(game: Game, ship: Unit): CpuShipRole {
+    const roles: CpuShipRole[] = ["striker", "interceptor", "escort"];
+    return roles[Math.floor(hash01(`${game.matchSeed}:${ship.id}:role`) * roles.length) % roles.length];
+}
 function drawBaseDestruction(ctx: CanvasRenderingContext2D, p: Vec, progress: number, alpha: number, color: string, scale = 1, wreck = true) {
     const t = clamp(progress, 0, 1);
     const flash = 1 - t;
@@ -369,8 +399,7 @@ const asteroidPosition = (asteroid: Asteroid, time: number): Vec => {
     const angle = asteroid.phase + angularSpeed * time;
     return { x: CENTRAL.x + Math.cos(angle) * asteroid.orbitRadius, y: CENTRAL.y + Math.sin(angle) * asteroid.orbitRadius };
 };
-// Game creation and turn rules
-function createGame(settings: GameSettings = DEFAULT_SETTINGS, phase: Phase = "setup"): Game {
+function createGame(settings: GameSettings = PAPER_DEFAULTS, phase: Phase = "setup", matchSeed = 1): Game {
     const units: Unit[] = [];
     const fleet = (player: 0 | 1, baseX: number, facing: number) => {
         const prefix = player === 0 ? "A" : "B";
@@ -381,13 +410,14 @@ function createGame(settings: GameSettings = DEFAULT_SETTINGS, phase: Phase = "s
     };
     fleet(0, 290, 1);
     fleet(1, 2710, -1);
-    return { units, missiles: [], asteroids: ASTEROID_SEEDS.map((asteroid) => ({ ...asteroid })), history: [], pendingOrders: [], planningComplete: [false, false], currentPlayer: 0, initiative: 0, actionInRound: 0, turn: 1, phase, selectedId: "p0-base", action: "LASER", winner: null, draw: false, nextMissileId: 1, time: 0, settings: { ...settings, actionsPerCommander: 1, colors: [...settings.colors] }, log: ["COMMANDER 1 has initiative.", "Each deployed ship and each base receives one action per round.", `All ${settings.fleetSize} ships begin inside each base.`, "Unassigned ships coast when their commander finishes planning.", "Base HP equals stored ship HP plus one core HP.", "A base may deploy or fire its laser.", "Ships carry four torpedoes; bases fire lasers only.", "Gravity and persistent inertia are active."] };
+    const initialAsteroids = asteroidLayout(matchSeed);
+    return { units, missiles: [], asteroids: initialAsteroids.map((asteroid) => ({ ...asteroid })), initialAsteroids: initialAsteroids.map((asteroid) => ({ ...asteroid })), history: [], pendingOrders: [], planningComplete: [false, false], currentPlayer: 0, initiative: 0, actionInRound: 0, turn: 1, phase, selectedId: "p0-base", action: "LASER", winner: null, draw: false, nextMissileId: 1, time: 0, matchSeed, cpuDoctrine: doctrineForSeed(matchSeed), settings: { ...settings, actionsPerCommander: 1, colors: [...settings.colors] }, log: [`MATCH SEED ${String(matchSeed).padStart(6, "0")}.`, "COMMANDER 1 has initiative.", "Each deployed ship and each base receives one action per round.", `All ${settings.fleetSize} ships begin inside each base.`, "Unassigned ships coast when their commander finishes planning.", "Base HP equals stored ship HP plus one core HP.", "A base may deploy or fire its laser.", "Ships carry four torpedoes; bases fire lasers only.", "Gravity and persistent inertia are active."] };
 }
 function cloneGame(game: Game): Game {
     return { ...game, settings: { ...game.settings, colors: [...game.settings.colors] }, planningComplete: [...game.planningComplete] as [
             boolean,
             boolean
-        ], units: game.units.map((u) => ({ ...u, pos: cloneVec(u.pos), vel: cloneVec(u.vel) })), missiles: game.missiles.map((m) => ({ ...m, pos: cloneVec(m.pos), vel: cloneVec(m.vel) })), asteroids: game.asteroids.map((asteroid) => ({ ...asteroid })), history: [...game.history], pendingOrders: game.pendingOrders.map((order) => ({ ...order, vector: cloneVec(order.vector), markerPos: cloneVec(order.markerPos), arrivalPos: order.arrivalPos ? cloneVec(order.arrivalPos) : undefined, arrivalVel: order.arrivalVel ? cloneVec(order.arrivalVel) : undefined, arrivalPath: order.arrivalPath?.map(cloneVec) })), log: [...game.log] };
+        ], units: game.units.map((u) => ({ ...u, pos: cloneVec(u.pos), vel: cloneVec(u.vel) })), missiles: game.missiles.map((m) => ({ ...m, pos: cloneVec(m.pos), vel: cloneVec(m.vel) })), asteroids: game.asteroids.map((asteroid) => ({ ...asteroid })), initialAsteroids: game.initialAsteroids.map((asteroid) => ({ ...asteroid })), history: [...game.history], pendingOrders: game.pendingOrders.map((order) => ({ ...order, vector: cloneVec(order.vector), markerPos: cloneVec(order.markerPos), arrivalPos: order.arrivalPos ? cloneVec(order.arrivalPos) : undefined, arrivalVel: order.arrivalVel ? cloneVec(order.arrivalVel) : undefined, arrivalPath: order.arrivalPath?.map(cloneVec) })), log: [...game.log] };
 }
 function reserveShipsFor(game: Game, player: 0 | 1) { return game.units.filter((u) => u.player === player && u.kind === "ship" && u.alive && !u.deployed); }
 function healthiestReserveFor(game: Game, player: 0 | 1) { return reserveShipsFor(game, player).sort((a, b) => b.armor - a.armor || a.label.localeCompare(b.label))[0]; }
@@ -411,8 +441,8 @@ function actorForSource(game: Game, source: CommandSource): Unit | undefined {
 function actorHasOrder(game: Game, actorId: string) { return game.pendingOrders.some((order) => order.actorId === actorId); }
 function laserVector(game: Game, order: PendingOrder, source: Unit): Vec {
     const halfAngle = (source.kind === "base" ? 1 : 2) * Math.PI / 180;
-    const a = hash01(`${game.turn}:${order.actorId}:${order.sourceId}:a`);
-    const b = hash01(`${game.turn}:${order.actorId}:${order.sourceId}:b`);
+    const a = hash01(`${game.matchSeed}:${game.turn}:${order.actorId}:${order.sourceId}:a`);
+    const b = hash01(`${game.matchSeed}:${game.turn}:${order.actorId}:${order.sourceId}:b`);
     return rotateVec(order.vector, ((a + b) - 1) * halfAngle);
 }
 function sourceLabel(source: CommandSource) {
@@ -423,7 +453,6 @@ function actionLabel(action: ActionKind, source: CommandSource) {
         return action;
     return isUnit(source) && source.kind === "base" ? "NO ACTION" : "COAST";
 }
-// Physics, targeting, and collision detection
 function accelerationAt(p: Vec): Vec {
     const d = sub(CENTRAL, p);
     const r = Math.max(35, mag(d));
@@ -528,6 +557,10 @@ function findOutcome(game: Game): {
         return { winner: 1, draw: false };
     if (!assetsRemain[1])
         return { winner: 0, draw: false };
+    const shipsRemain = game.units.some((unit) => unit.kind === "ship" && unit.alive);
+    const torpedoesRemain = game.missiles.some((missile) => missile.alive);
+    if (!shipsRemain && !torpedoesRemain)
+        return { winner: null, draw: true };
     return { winner: null, draw: false };
 }
 function preferredUnit(game: Game, player: 0 | 1) {
@@ -567,8 +600,15 @@ function actionDisabledReason(game: Game, source: CommandSource | undefined, act
     return null;
 }
 function preferredAction(game: Game, source: CommandSource): ActionKind | null {
-    const choices: ActionKind[] = isUnit(source) ? (source.kind === "ship" ? ["THRUST", "TORPEDO", "LASER"] : ["LASER", "DEPLOY"]) : [];
+    const choices: ActionKind[] = isUnit(source) ? (source.kind === "ship" ? ["LASER", "THRUST", "TORPEDO"] : ["LASER", "DEPLOY"]) : [];
     return choices.find((action) => !actionDisabledReason(game, source, action)) ?? null;
+}
+function rememberedAction(game: Game, source: CommandSource, remembered: ActionKind): ActionKind {
+    if (!actionDisabledReason(game, source, remembered))
+        return remembered;
+    if (!actionDisabledReason(game, source, "LASER"))
+        return "LASER";
+    return preferredAction(game, source) ?? "LASER";
 }
 function actionVector(action: ActionKind, raw: Vec, power: number, selected: CommandSource): Vec {
     const dir = mag(raw) > 1e-5 ? unitVec(raw) : { x: selected.player === 0 ? 1 : -1, y: 0 };
@@ -583,7 +623,6 @@ function actionVector(action: ActionKind, raw: Vec, power: number, selected: Com
     const laserRange = lerp(240, 1160, power);
     return mul(dir, isUnit(selected) && selected.kind === "ship" ? laserRange * 2 / 3 : laserRange);
 }
-// Preview paths use the same integrator and collision rules as resolution.
 function previewPath(game: Game, selected: CommandSource, action: ActionKind, raw: Vec, power: number) {
     const applied = actionVector(action, raw, power, selected);
     if (action === "NONE")
@@ -629,9 +668,8 @@ function previewPath(game: Game, selected: CommandSource, action: ActionKind, ra
         }
         const collisionPoint = unitCollision && (!collision || unitCollision.t <= collision.t) ? unitCollision.point : collision?.point;
         if (collisionPoint || pos.x < 0 || pos.y < 0 || pos.x > WORLD_W || pos.y > WORLD_H) {
-            const impactPoint = collisionPoint ?? { x: clamp(pos.x, 0, WORLD_W), y: clamp(pos.y, 0, WORLD_H) };
-            impact = impactPoint;
-            points.push(cloneVec(impactPoint));
+            impact = collisionPoint ?? { x: clamp(pos.x, 0, WORLD_W), y: clamp(pos.y, 0, WORLD_H) };
+            points.push(cloneVec(impact));
             break;
         }
         const t = (i + 1) * dt;
@@ -674,7 +712,6 @@ function predictArrival(game: Game, ship: Unit, duration = INTERVAL): {
     }
     return { pos, vel, path, doomed: false };
 }
-// Deterministic CPU planner. It receives no information unavailable to a player.
 function isCpuTurn(game: Game) { return game.settings.opponent === "cpu" && game.currentPlayer === 1 && game.phase === "ready"; }
 type CpuTrajectoryReport = {
     doomed: boolean;
@@ -783,18 +820,19 @@ function cpuHitIsEnemy(game: Game, hit: ReturnType<typeof lineTarget>, player: 0
         return game.missiles.some((missile) => missile.id === hit.id && missile.player !== player && missile.alive);
     return false;
 }
-function cpuOrbitalVelocity(source: Unit): Vec {
+function cpuOrbitalVelocity(game: Game, source: Unit): Vec {
     const radial = unitVec(sub(source.pos, CENTRAL));
     const prograde = { x: -radial.y, y: radial.x };
     const direction = source.player === 1 ? -1 : 1;
-    return mul(prograde, Math.sqrt(CENTRAL.mu / Math.max(CENTRAL.r + 90, distance(source.pos, CENTRAL))) * direction);
+    const cpuDirection = hash01(`${game.matchSeed}:cpu-orbit-direction`) < .5 ? -1 : 1;
+    return mul(prograde, Math.sqrt(CENTRAL.mu / Math.max(CENTRAL.r + 90, distance(source.pos, CENTRAL))) * (source.player === 1 ? cpuDirection : direction));
 }
 function cpuSafeVector(game: Game, source: CommandSource, action: ActionKind, desired: Vec, requestedPower: number, target?: Unit): {
     raw: Vec;
     power: number;
     safe: boolean;
 } {
-    const side = hash01(`${game.turn}:${source.id}:${action}:course`) < .5 ? -1 : 1;
+    const side = hash01(`${game.matchSeed}:${game.turn}:${source.id}:${action}:course`) < .5 ? -1 : 1;
     const offsets = [0, side * 12, -side * 12, side * 30, -side * 30, side * 55, -side * 55, side * 90, -side * 90];
     const powers = Array.from(new Set([requestedPower, 1, .7, .4, .22].map((value) => Math.round(clamp(value, .12, 1) * 100) / 100)));
     const horizon = action === "TORPEDO" ? INTERVAL * 7 : INTERVAL * 7;
@@ -807,7 +845,9 @@ function cpuSafeVector(game: Game, source: CommandSource, action: ActionKind, de
         for (const degrees of offsets) {
             const raw = mul(rotateVec(unitVec(desired), degrees * Math.PI / 180), MAX_VECTOR_INPUT);
             const report = cpuTrajectoryReport(game, source, action, raw, power, horizon, target);
-            if (report.doomed || report.minPlanetClearance < (action === "TORPEDO" ? 18 : 24) || (action === "THRUST" || action === "DEPLOY") && report.minFriendlyClearance < 34)
+            const shipClearance = game.cpuDoctrine === "raider" ? 30 : game.cpuDoctrine === "screen" ? 44 : 36;
+            const planetClearance = game.cpuDoctrine === "raider" ? 18 : game.cpuDoctrine === "screen" ? 30 : 24;
+            if (report.doomed || report.minPlanetClearance < (action === "TORPEDO" ? 18 : planetClearance) || (action === "THRUST" || action === "DEPLOY") && report.minFriendlyClearance < shipClearance)
                 continue;
             let score = clamp(report.minPlanetClearance, 0, 180) / 120 - Math.abs(degrees) / 65 - Math.abs(power - requestedPower);
             if (target && Number.isFinite(report.minTargetDistance))
@@ -821,6 +861,9 @@ function cpuSafeVector(game: Game, source: CommandSource, action: ActionKind, de
                 score -= Math.abs(dot(report.finalVel, radial)) / 14;
                 score -= Math.abs(dot(report.finalVel, tangent) - circularSpeed) / 18;
             }
+            // Small seeded variation breaks ties between comparably strong courses
+            // without ever allowing an unsafe candidate into consideration.
+            score += (hash01(`${game.matchSeed}:${game.turn}:${source.id}:${action}:${degrees}:${power}`) - .5) * .2;
             if (!best || score > best.score)
                 best = { raw, power, score };
         }
@@ -829,11 +872,17 @@ function cpuSafeVector(game: Game, source: CommandSource, action: ActionKind, de
 function cpuChoiceForActor(game: Game, actor: Unit): CpuChoice | null {
     const enemies = game.units.filter((unit) => unit.player === 0 && isTargetable(unit));
     const baseTarget = enemies.find((unit) => unit.kind === "base");
-    const nearestShip = enemies.filter((unit) => unit.kind === "ship").sort((a, b) => distance(actor.pos, a.pos) - distance(actor.pos, b.pos))[0];
-    const target = nearestShip && distance(actor.pos, nearestShip.pos) < 1250 ? nearestShip : baseTarget ?? nearestShip;
+    const enemyShips = enemies.filter((unit) => unit.kind === "ship").sort((a, b) => distance(actor.pos, a.pos) - distance(actor.pos, b.pos));
+    const nearestShip = enemyShips[0];
+    const ownBase = game.units.find((unit) => unit.player === actor.player && unit.kind === "base" && unit.alive);
+    const role = actor.kind === "ship" ? shipRoleFor(game, actor) : "escort";
+    const shipNearOwnBase = ownBase ? [...enemyShips].sort((a, b) => distance(ownBase.pos, a.pos) - distance(ownBase.pos, b.pos))[0] : nearestShip;
+    const target = game.cpuDoctrine === "hunter" ? nearestShip ?? baseTarget
+        : game.cpuDoctrine === "siege" ? baseTarget ?? nearestShip
+            : game.cpuDoctrine === "screen" ? shipNearOwnBase ?? baseTarget
+                : role === "striker" ? baseTarget ?? nearestShip : nearestShip ?? baseTarget;
     if (!target)
         return null;
-    const direct = sub(target.pos, actor.pos);
     if (actor.kind === "base") {
         const threats = game.missiles.filter((missile) => missile.alive).map((missile) => cpuMissileThreat(game, missile, actor)).filter((entry) => entry.threatening).sort((a, b) => a.danger - b.danger);
         for (const { missile } of threats) {
@@ -843,22 +892,26 @@ function cpuChoiceForActor(game: Game, actor: Unit): CpuChoice | null {
             if (hit?.type === "torpedo" && hit.id === missile.id)
                 return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(intercept), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is destroying a torpedo predicted to strike the base.` };
         }
-        const shot = actionVector("LASER", direct, 1, actor);
-        const hit = lineTarget(game, actor.pos, add(actor.pos, shot), actor);
-        if (cpuHitIsEnemy(game, hit, actor.player))
-            return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(direct), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is calculating a long-range laser shot.` };
+        for (const laserTarget of [...enemyShips, ...(baseTarget ? [baseTarget] : [])]) {
+            const aim = sub(laserTarget.pos, actor.pos);
+            const shot = actionVector("LASER", aim, 1, actor);
+            const hit = lineTarget(game, actor.pos, add(actor.pos, shot), actor);
+            if (cpuHitIsEnemy(game, hit, actor.player))
+                return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(aim), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is calculating a long-range laser shot on ${laserTarget.label}.` };
+        }
         const reserves = reserveShipsFor(game, actor.player);
         const deployed = deployedShipsFor(game, actor.player).length;
         const deploymentGoal = Math.min(game.settings.fleetSize, Math.max(2, Math.ceil(game.settings.fleetSize / 2)));
-        if (reserves.length && deployed < deploymentGoal) {
-            const orbital = cpuOrbitalVelocity(actor);
-            const vector = cpuSafeVector(game, actor, "DEPLOY", orbital, 1);
+        const doctrineGoal = game.cpuDoctrine === "raider" ? game.settings.fleetSize : game.cpuDoctrine === "hunter" ? Math.ceil(game.settings.fleetSize * .75) : game.cpuDoctrine === "screen" ? Math.min(2, game.settings.fleetSize) : deploymentGoal;
+        if (reserves.length && deployed < doctrineGoal) {
+            const lane = (hash01(`${game.matchSeed}:${reserves[0].id}:deployment-lane`) - .5) * .5;
+            const orbital = rotateVec(cpuOrbitalVelocity(game, actor), lane);
+            const vector = cpuSafeVector(game, actor, "DEPLOY", orbital, game.cpuDoctrine === "raider" ? 1 : .82);
             if (vector.safe)
-                return { sourceId: actor.id, action: "DEPLOY", raw: vector.raw, power: vector.power, note: `${actor.label} is plotting a long-horizon orbital deployment.` };
+                return { sourceId: actor.id, action: "DEPLOY", raw: vector.raw, power: vector.power, note: `${actor.label} is deploying a ${game.cpuDoctrine} formation.` };
         }
         return null;
     }
-    const ownBase = game.units.find((unit) => unit.player === actor.player && unit.kind === "base" && unit.alive);
     if (ownBase) {
         const threats = game.missiles.filter((missile) => missile.alive).map((missile) => cpuMissileThreat(game, missile, ownBase)).filter((entry) => entry.threatening).sort((a, b) => a.danger - b.danger);
         for (const { missile } of threats) {
@@ -869,27 +922,36 @@ function cpuChoiceForActor(game: Game, actor: Unit): CpuChoice | null {
                 return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(intercept), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is screening the base from ${missile.id.toUpperCase()}.` };
         }
     }
-    const laser = actionVector("LASER", direct, 1, actor);
-    const laserHit = lineTarget(game, actor.pos, add(actor.pos, laser), actor);
-    if (cpuHitIsEnemy(game, laserHit, actor.player))
-        return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(direct), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is choosing a high-confidence laser shot on ${target.label}.` };
+    const laserTargets = game.cpuDoctrine === "siege" && baseTarget ? [baseTarget, ...enemyShips] : [...enemyShips, ...(baseTarget ? [baseTarget] : [])];
+    for (const laserTarget of laserTargets) {
+        const aim = sub(laserTarget.pos, actor.pos);
+        const laser = actionVector("LASER", aim, 1, actor);
+        const laserHit = lineTarget(game, actor.pos, add(actor.pos, laser), actor);
+        if (cpuHitIsEnemy(game, laserHit, actor.player))
+            return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(aim), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is choosing a high-confidence laser shot on ${laserTarget.label}.` };
+    }
     const torpedoesCommitted = game.pendingOrders.filter((order) => order.player === actor.player && order.action === "TORPEDO").length;
-    if (actor.missiles > 0 && baseTarget && torpedoesCommitted === 0 && distance(actor.pos, baseTarget.pos) < 1700) {
+    const torpedoBias = { hunter: .5, siege: .95, screen: .28, raider: .72 }[game.cpuDoctrine];
+    const torpedoTurn = hash01(`${game.matchSeed}:${game.turn}:${actor.id}:torpedo`) < torpedoBias;
+    if (actor.missiles > 0 && baseTarget && torpedoesCommitted === 0 && torpedoTurn && distance(actor.pos, baseTarget.pos) < 1700) {
         const launch = cpuTorpedoSolution(game, actor, baseTarget);
         if (launch)
             return { sourceId: actor.id, action: "TORPEDO", raw: launch.raw, power: launch.power, note: `${actor.label} found a predicted torpedo collision with ${baseTarget.label}.` };
     }
-    const orbital = cpuOrbitalVelocity(actor);
-    const interceptVelocity = mul(unitVec(sub(add(target.pos, mul(target.vel, INTERVAL * 1.4)), actor.pos)), Math.max(14, mag(orbital)));
-    const desiredVelocity = add(mul(orbital, .2), mul(interceptVelocity, .8));
+    const orbital = cpuOrbitalVelocity(game, actor);
+    const lead = game.cpuDoctrine === "hunter" ? 1.15 : game.cpuDoctrine === "siege" ? 1.65 : game.cpuDoctrine === "screen" ? 1.35 : 1.05;
+    const aggression = game.cpuDoctrine === "screen" ? .62 : game.cpuDoctrine === "siege" ? .78 : game.cpuDoctrine === "hunter" ? .9 : .94;
+    const laneAngle = role === "striker" ? 0 : role === "interceptor" ? .16 : -.16;
+    const approach = rotateVec(unitVec(sub(add(target.pos, mul(target.vel, INTERVAL * lead)), actor.pos)), laneAngle);
+    const interceptVelocity = mul(approach, Math.max(14, mag(orbital)));
+    const desiredVelocity = add(mul(orbital, 1 - aggression), mul(interceptVelocity, aggression));
     const deltaV = sub(desiredVelocity, actor.vel);
     const coast = cpuTrajectoryReport(game, actor, "NONE", actor.vel, 0, INTERVAL * 7, target);
     if (!coast.doomed && coast.minPlanetClearance > 55 && coast.minTargetDistance < 620 && mag(deltaV) < 2.5)
         return null;
     const vector = cpuSafeVector(game, actor, "THRUST", deltaV, clamp(mag(deltaV) / MAX_DV, .28, 1), target);
-    return vector.safe ? { sourceId: actor.id, action: "THRUST", raw: vector.raw, power: vector.power, note: `${actor.label} is crossing the asteroid lanes toward ${target.label}.` } : null;
+    return vector.safe ? { sourceId: actor.id, action: "THRUST", raw: vector.raw, power: vector.power, note: `${actor.label} is executing a ${role} approach toward ${target.label}.` } : null;
 }
-// Flight-computer readouts
 function orbitalTelemetry(pos: Vec, vel: Vec, impact: boolean) {
     const rVec = sub(pos, CENTRAL);
     const r = mag(rVec);
@@ -899,11 +961,10 @@ function orbitalTelemetry(pos: Vec, vel: Vec, impact: boolean) {
     const periapsis = h * h / (CENTRAL.mu * (1 + e)) - CENTRAL.r;
     return { consequence: impact || periapsis <= 0 ? "IMPACT" : energy < 0 ? "BOUND" : "ESCAPE", periapsis };
 }
-// React interface and canvas renderer
-function GraphiteFleet() {
+function GamePrototype() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const wrapRef = useRef<HTMLDivElement>(null);
-    const gameRef = useRef<Game>(createGame(DEFAULT_SETTINGS, "setup"));
+    const gameRef = useRef<Game>(createGame(PAPER_DEFAULTS, "setup"));
     const cameraRef = useRef<Camera>({ x: 560, y: 1000, zoom: .72 });
     const aimRef = useRef<Aim>({ pointerId: null, anchor: { x: 0, y: 0 }, raw: { x: 1, y: 0 }, power: .45, previousRaw: { x: 1, y: 0 }, previousPower: .45, moved: false, keyboard: true });
     const resolutionRef = useRef<Resolution | null>(null);
@@ -926,15 +987,19 @@ function GraphiteFleet() {
     const cpuTimerRef = useRef(0);
     const cpuCommitTimerRef = useRef(0);
     const cpuThinkingRef = useRef(false);
+    const lastActionRef = useRef<[
+        ActionKind,
+        ActionKind
+    ]>(["LASER", "LASER"]);
     const canvasSize = useRef({ width: 1, height: 1, dpr: 1 });
     const telemetryRef = useRef<Telemetry>({ ...INITIAL_TELEMETRY });
     const reducedMotion = useRef(false);
-    const [gameView, setGameView] = useState<Game>(() => createGame(DEFAULT_SETTINGS, "setup"));
+    const [gameView, setGameView] = useState<Game>(() => createGame(PAPER_DEFAULTS, "setup"));
     const [telemetryView, setTelemetryView] = useState<Telemetry>({ ...INITIAL_TELEMETRY });
     const [viewMode, setViewMode] = useState<ViewMode>("tactical");
     const [power, setPower] = useState(.45);
     const [vectorView, setVectorView] = useState<Vec>({ x: 1, y: 0 });
-    const [settingsDraft, setSettingsDraft] = useState<GameSettings>({ ...DEFAULT_SETTINGS, colors: [...DEFAULT_SETTINGS.colors] });
+    const [settingsDraft, setSettingsDraft] = useState<GameSettings>({ ...PAPER_DEFAULTS, colors: [...PAPER_DEFAULTS.colors] });
     const [liveMessage, setLiveMessage] = useState("Choose the match format.");
     const [replayActive, setReplayActive] = useState(false);
     const [gameoverMinimized, setGameoverMinimized] = useState(false);
@@ -1516,6 +1581,35 @@ function GraphiteFleet() {
             ctx.restore();
         });
     }, [worldToScreen]);
+    const drawCoastPredictions = useCallback((ctx: CanvasRenderingContext2D, camera: Camera) => {
+        const game = gameRef.current;
+        if (game.phase !== "ready" && game.phase !== "aiming")
+            return;
+        deployedShipsFor(game, game.currentPlayer).forEach((ship) => {
+            const coast = predictArrival(game, ship);
+            const color = coast.doomed ? "#ffd24f" : game.settings.colors[ship.player];
+            ctx.save();
+            ctx.globalAlpha = coast.doomed ? .72 : .34;
+            ctx.strokeStyle = color;
+            ctx.fillStyle = color;
+            ctx.lineWidth = 1.2;
+            ctx.setLineDash([3, 6]);
+            ctx.beginPath();
+            coast.path.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index)
+                ctx.lineTo(plotted.x, plotted.y);
+            else
+                ctx.moveTo(plotted.x, plotted.y); });
+            ctx.stroke();
+            const end = worldToScreen(coast.pos, camera);
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.arc(end.x, end.y, 4.5, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.font = "700 7px ui-monospace,monospace";
+            ctx.fillText(coast.doomed ? "COAST · IMPACT" : "COAST", end.x + 7, end.y - 5);
+            ctx.restore();
+        });
+    }, [worldToScreen]);
     const drawMissile = useCallback((ctx: CanvasRenderingContext2D, m: Missile, camera: Camera, pos: Vec, heading: number) => {
         if (!m.alive)
             return;
@@ -1858,12 +1952,12 @@ function GraphiteFleet() {
         const isBorn = (kind: TimedBirth["kind"], id: string) => !resolution || !resolution.births.some((birth) => birth.kind === kind && birth.id === id) || resolution.births.some((birth) => birth.kind === kind && birth.id === id && birth.at <= resolution.progress);
         const visualArmor = (unit: Unit) => resolution?.damage.filter((hit) => hit.id === unit.id && hit.at <= resolution.progress).at(-1)?.armor ?? gameRef.current.units.find((original) => original.id === unit.id)?.armor ?? unit.armor;
         const replayTurn = replay ? replayRef.current.progress * maxHistoryTurn : Infinity;
-        const visualAsteroids = (replay ? ASTEROID_SEEDS : gameRef.current.asteroids).map((asteroid) => { const replayArmor = replay ? gameRef.current.history.filter((event): event is DamageEvent => event.type === "damage" && event.id === asteroid.id && event.turn - 1 + (event.phase ?? 0) <= replayTurn).at(-1)?.armor : undefined; return { ...asteroid, armor: replayArmor ?? resolution?.damage.filter((hit) => hit.id === asteroid.id && hit.at <= resolution.progress).at(-1)?.armor ?? asteroid.armor, alive: asteroid.alive && !isDead("asteroid", asteroid.id) && !gameRef.current.history.some((event) => event.type === "rock-destroy" && event.label === asteroid.id && event.turn - 1 + (event.phase ?? 0) <= replayTurn) }; });
+        const visualAsteroids = (replay ? gameRef.current.initialAsteroids : gameRef.current.asteroids).map((asteroid) => { const replayArmor = replay ? gameRef.current.history.filter((event): event is DamageEvent => event.type === "damage" && event.id === asteroid.id && event.turn - 1 + (event.phase ?? 0) <= replayTurn).at(-1)?.armor : undefined; return { ...asteroid, armor: replayArmor ?? resolution?.damage.filter((hit) => hit.id === asteroid.id && hit.at <= resolution.progress).at(-1)?.armor ?? asteroid.armor, alive: asteroid.alive && !isDead("asteroid", asteroid.id) && !gameRef.current.history.some((event) => event.type === "rock-destroy" && event.label === asteroid.id && event.turn - 1 + (event.phase ?? 0) <= replayTurn) }; });
         drawGrid(ctx, camera);
         drawHistory(ctx, camera, mode);
         drawBodies(ctx, camera, sceneTime, visualAsteroids);
         if (replay) {
-            const initial = createGame(gameRef.current.settings, "ready");
+            const initial = createGame(gameRef.current.settings, "ready", gameRef.current.matchSeed);
             initial.units.filter((unit) => unit.kind === "base" && !gameRef.current.history.some((event) => event.type === "destroy" && event.label === unit.label && event.turn <= replayTurn)).forEach((base) => {
                 const status = gameRef.current.history.filter((event): event is BaseStatusEvent => event.type === "base-status" && event.player === base.player && event.turn <= replayTurn).at(-1);
                 const initialArmors = initial.units.filter((ship) => ship.player === base.player && ship.kind === "ship").map((ship) => ship.armor);
@@ -1893,6 +1987,8 @@ function GraphiteFleet() {
                 ctx.stroke();
                 ctx.restore();
             });
+        if (interactive && !resolution)
+            drawCoastPredictions(ctx, camera);
         const units = resolution ? resolution.game.units : gameRef.current.units;
         units.forEach((u) => { const original = gameRef.current.units.find((unit) => unit.id === u.id); const visible = resolution ? !isDead("unit", u.id) && (isTargetable(u) || Boolean(original && isTargetable(original))) : isTargetable(u); if (visible)
             drawUnit(ctx, { ...u, alive: true, armor: visualArmor(u) }, camera, interactive ? animatedPosition(u.id, u.pos) : u.pos, interactive ? animatedHeading(u.id, u.heading) : u.heading, mode === "history"); });
@@ -1908,7 +2004,7 @@ function GraphiteFleet() {
             drawIndicators(ctx, camera);
             drawMinimap(ctx, camera, sceneTime, visualAsteroids);
         }
-    }, [animatedHeading, animatedPosition, drawAim, drawBodies, drawGrid, drawHistory, drawIndicators, drawMinimap, drawMissile, drawPlannedGhosts, drawReplayMarkers, drawResolutionEffects, drawUnit, worldToScreen]);
+    }, [animatedHeading, animatedPosition, drawAim, drawBodies, drawCoastPredictions, drawGrid, drawHistory, drawIndicators, drawMinimap, drawMissile, drawPlannedGhosts, drawReplayMarkers, drawResolutionEffects, drawUnit, worldToScreen]);
     const draw = useCallback(() => {
         const canvas = canvasRef.current;
         const ctx = canvas?.getContext("2d");
@@ -2013,7 +2109,7 @@ function GraphiteFleet() {
             return;
         game.selectedId = id;
         if (!actorHasOrder(game, u.id))
-            game.action = u.kind === "base" ? "LASER" : "THRUST";
+            game.action = rememberedAction(game, u, lastActionRef.current[game.currentPlayer]);
         else if (actionDisabledReason(game, u, game.action))
             game.action = preferredAction(game, u) ?? game.action;
         const defaultDirection = u.kind === "ship" && mag(u.vel) > .01 ? unitVec(u.vel) : { x: u.player === 0 ? 1 : -1, y: 0 };
@@ -2032,6 +2128,7 @@ function GraphiteFleet() {
         if (actionDisabledReason(game, source, action))
             return;
         game.action = action;
+        lastActionRef.current[game.currentPlayer] = action;
         aimRef.current.keyboard = true;
         computeTelemetry(aimRef.current.raw, aimRef.current.power);
         setLiveMessage(action === "NONE" ? `${actionLabel(action, source)} selected. Commit it to use this asset’s action without thrust or fire.` : `${action} declared. Plot its vector, review the trace, then commit.`);
@@ -2060,7 +2157,11 @@ function GraphiteFleet() {
         next.winner = outcome.winner;
         next.draw = outcome.draw;
         if (next.winner !== null || next.draw) {
-            const drawMessage = "No controllable assets remain on either side. The battle ends in a draw.";
+            const basesAlive = next.units.filter((unit) => unit.kind === "base" && unit.alive).length;
+            const shipsAlive = next.units.some((unit) => unit.kind === "ship" && unit.alive);
+            const drawMessage = basesAlive === 2 && !shipsAlive
+                ? "All ships and torpedoes are gone. The surviving bases cannot engage; the battle ends in a draw."
+                : "No controllable assets remain on either side. The battle ends in a draw.";
             next.pendingOrders = [];
             next.phase = "gameover";
             next.log.unshift(next.draw ? drawMessage : `COMMANDER ${next.winner! + 1} wins the battle.`);
@@ -2080,10 +2181,8 @@ function GraphiteFleet() {
             const chosen = preferredUnit(next, next.currentPlayer);
             if (chosen) {
                 next.selectedId = chosen.id;
-                next.action = preferredAction(next, chosen) ?? next.action;
+                next.action = rememberedAction(next, chosen, lastActionRef.current[next.currentPlayer]);
             }
-            if (chosen)
-                next.action = preferredAction(next, chosen) ?? next.action;
             const assets = planningActors(next, next.currentPlayer).length;
             next.log.unshift(`ROUND ${next.turn}: COMMANDER ${next.currentPlayer + 1} plots first for ${assets} assets.`);
             setLiveMessage(`Round ${next.turn}. Commander ${next.currentPlayer + 1} assigns up to one action to each asset. Unassigned ships coast.`);
@@ -2184,7 +2283,7 @@ function GraphiteFleet() {
             const chosen = unordered[0];
             if (chosen) {
                 working.selectedId = chosen.id;
-                working.action = preferredAction(working, chosen) ?? working.action;
+                working.action = rememberedAction(working, chosen, lastActionRef.current[working.currentPlayer]);
             }
             working.actionInRound = working.pendingOrders.length;
             gameRef.current = working;
@@ -2202,7 +2301,7 @@ function GraphiteFleet() {
             const chosen = preferredUnit(working, other);
             if (chosen) {
                 working.selectedId = chosen.id;
-                working.action = preferredAction(working, chosen) ?? working.action;
+                working.action = rememberedAction(working, chosen, lastActionRef.current[other]);
             }
             working.actionInRound = working.pendingOrders.length;
             gameRef.current = working;
@@ -2325,8 +2424,15 @@ function GraphiteFleet() {
                 const next = verlet(mover.pos, mover.vel, STEP, working.settings.gravity);
                 mover.pos = next.pos;
                 mover.vel = next.vel;
-                if ("age" in mover)
+                if ("age" in mover) {
                     mover.age += STEP;
+                    if (mover.age >= MAX_TORPEDO_AGE) {
+                        mover.alive = false;
+                        destroyAt(mover.id, "torpedo", timelineAt((step + 1) / STEPS));
+                        working.log.unshift(`${sourceLabel(mover)} exhausted its guidance package.`);
+                        return;
+                    }
+                }
                 else if (mover.kind === "ship" && distance(old, mover.pos) > .001)
                     mover.heading = Math.atan2(mover.pos.y - old.y, mover.pos.x - old.x);
                 const at = timelineAt((step + 1) / STEPS);
@@ -2608,7 +2714,7 @@ function GraphiteFleet() {
                 game.selectedId = hit.source.id;
                 if (isUnit(hit.source)) {
                     if (!actorHasOrder(game, hit.source.id))
-                        game.action = hit.source.kind === "base" ? "LASER" : "THRUST";
+                        game.action = rememberedAction(game, hit.source, lastActionRef.current[game.currentPlayer]);
                     else if (actionDisabledReason(game, hit.source, game.action))
                         game.action = preferredAction(game, hit.source) ?? game.action;
                     const direction = hit.source.kind === "ship" && mag(hit.source.vel) > .01 ? unitVec(hit.source.vel) : { x: Math.cos(hit.source.heading), y: Math.sin(hit.source.heading) };
@@ -2848,8 +2954,9 @@ function GraphiteFleet() {
         window.clearTimeout(cpuTimerRef.current);
         window.clearTimeout(cpuCommitTimerRef.current);
         cpuThinkingRef.current = false;
+        lastActionRef.current = ["LASER", "LASER"];
         cancelAnimationFrame(rafRef.current);
-        gameRef.current = createGame({ ...settingsDraft, actionsPerCommander: 1, colors: [...settingsDraft.colors] }, "ready");
+        gameRef.current = createGame({ ...settingsDraft, actionsPerCommander: 1, colors: [...settingsDraft.colors] }, "ready", generateMatchSeed());
         resolutionRef.current = null;
         replayRef.current.active = false;
         aimRef.current.raw = { x: 1, y: 0 };
@@ -2860,7 +2967,7 @@ function GraphiteFleet() {
         setGameoverMinimized(false);
         moveCameraTo(commanderCamera(gameRef.current, 0), false);
         computeTelemetry(aimRef.current.raw, .45);
-        setLiveMessage("Commander 1 has initiative. Assign one action to each asset, then finish planning. Unassigned ships coast.");
+        setLiveMessage(`Match seed ${String(gameRef.current.matchSeed).padStart(6, "0")}. Commander 1 has initiative. Assign one action to each asset, then finish planning.`);
         bump();
         draw();
     }, [bump, commanderCamera, computeTelemetry, draw, moveCameraTo, settingsDraft]);
@@ -2869,6 +2976,7 @@ function GraphiteFleet() {
         window.clearTimeout(cpuTimerRef.current);
         window.clearTimeout(cpuCommitTimerRef.current);
         cpuThinkingRef.current = false;
+        lastActionRef.current = ["LASER", "LASER"];
         cancelAnimationFrame(rafRef.current);
         cancelAnimationFrame(cameraRafRef.current);
         setSettingsDraft({ ...gameRef.current.settings, actionsPerCommander: 1, colors: [...gameRef.current.settings.colors] });
@@ -2948,6 +3056,7 @@ function GraphiteFleet() {
     const aliveShips = [0, 1].map((p) => game.units.filter((u) => u.player === p && u.kind === "ship" && u.alive).length);
     const reserveShips = [0, 1].map((p) => game.units.filter((u) => u.player === p && u.kind === "ship" && u.alive && !u.deployed).length);
     const activeShips = [0, 1].map((p) => game.units.filter((u) => u.player === p && u.kind === "ship" && u.alive && u.deployed));
+    const baseOnlyDraw = game.draw && game.units.filter((unit) => unit.kind === "base" && unit.alive).length === 2 && !game.units.some((unit) => unit.kind === "ship" && unit.alive);
     const availabilityGame = game.phase === "aiming" ? { ...game, phase: "ready" as Phase } : game;
     const actionReason = (action: ActionKind) => actionDisabledReason(availabilityGame, selected, action);
     const declaredActionReason = actionReason(game.action);
@@ -2986,11 +3095,11 @@ function GraphiteFleet() {
         shipsLost: game.history.filter((event) => event.type === "destroy" && /^[AB]-\d/.test(event.label)).length,
         impacts: game.history.filter((event) => event.type === "impact").length,
     };
-    return (<main className="game-shell" data-theme="dark" style={shellStyle}>
+    return (<main className="prototype-shell" data-theme="dark" style={shellStyle}>
       <a className="skip-link" href="#command-deck">Skip to command controls</a>
       <header className="topbar">
-        <div className="brand"><p>Proctor Creative</p><h1>GRAPHITE_FLEET <span className="subtitle-tag">{"// SPACE BATTLE"}</span></h1></div>
-        <div className="turn-readout" aria-live="polite"><span>{game.phase === "setup" ? "FLEET RULES · MATCH SETUP" : `ROUND ${String(game.turn).padStart(2, "0")} · ${game.pendingOrders.length}/${actionSlots} ORDERS · ${game.phase.toUpperCase()}`}</span><strong style={{ color: game.settings.colors[game.currentPlayer] }}>{game.phase === "setup" ? "CHOOSE FORMAT" : `COMMANDER ${game.currentPlayer + 1}${game.settings.opponent === "cpu" && game.currentPlayer === 1 ? " · CPU" : ""} · ${unorderedActors.length} UNASSIGNED · SHIPS ${aliveShips[0]}—${aliveShips[1]}`}</strong></div>
+        <div className="brand"><p>Proctor Creative</p><h1>GRAPHITE_FLEET <span className="prototype-tag">{"// SPACE BATTLE"}</span></h1></div>
+        <div className="turn-readout" aria-live="polite"><span>{game.phase === "setup" ? "FLEET RULES · MATCH SETUP" : `ROUND ${String(game.turn).padStart(2, "0")} · ${game.pendingOrders.length}/${actionSlots} ORDERS · ${game.phase.toUpperCase()} · SEED ${String(game.matchSeed).padStart(6, "0")}`}</span><strong style={{ color: game.settings.colors[game.currentPlayer] }}>{game.phase === "setup" ? "CHOOSE FORMAT" : `COMMANDER ${game.currentPlayer + 1}${game.settings.opponent === "cpu" && game.currentPlayer === 1 ? " · CPU" : ""} · ${unorderedActors.length} UNASSIGNED · SHIPS ${aliveShips[0]}—${aliveShips[1]}`}</strong></div>
       </header>
 
       <section className="game-layout">
@@ -3000,7 +3109,7 @@ function GraphiteFleet() {
           <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">{liveMessage}</div>
           {game.phase === "resolving" && <div className="resolve-banner">Universe advancing · 6 seconds</div>}
           {cpuTurn && <div className="cpu-banner" role="status">CPU Commander plotting</div>}
-          {game.phase === "gameover" && !replayActive && <section className={`gameover-panel ${gameoverMinimized ? "minimized" : ""}`} role="dialog" aria-modal="false" aria-labelledby={gameoverMinimized ? undefined : "victory-title"} aria-label={gameoverMinimized ? "Battle results minimized" : undefined} onPointerDown={(event) => event.stopPropagation()}>{gameoverMinimized ? <><button className="gameover-expand" type="button" aria-label="Expand battle results" onClick={toggleGameoverPanel}>▣ <span>RESULTS</span></button><button className="gameover-new-match" type="button" onClick={resetToSetup}>New Match</button></> : <><button className="gameover-minimize" type="button" aria-label="Minimize battle results" onClick={toggleGameoverPanel}>▁</button><p className="eyebrow">Battle record complete</p><h2 id="victory-title">{game.draw ? "Draw." : `Commander ${game.winner! + 1} wins.`}</h2><p>{game.draw ? "No controllable assets remain on either side." : "The opposing commander has no controllable assets remaining."}</p><dl className="battle-stats"><div><dt>Rounds</dt><dd>{game.turn}</dd></div><div><dt>Ships deployed</dt><dd>{matchStats.deployed}</dd></div><div><dt>Ships lost</dt><dd>{matchStats.shipsLost}</dd></div><div><dt>Lasers fired</dt><dd>{matchStats.lasers}</dd></div><div><dt>Torpedoes fired</dt><dd>{matchStats.torpedoes}</dd></div><div><dt>Impact marks</dt><dd>{matchStats.impacts}</dd></div></dl><div className="gameover-actions"><button autoFocus type="button" onClick={startReplay}>Watch replay</button><button type="button" onClick={toggleGameoverPanel}>Minimize</button><button type="button" onClick={resetToSetup}>New match</button></div></>}</section>}
+          {game.phase === "gameover" && !replayActive && <section className={`gameover-panel ${gameoverMinimized ? "minimized" : ""}`} role="dialog" aria-modal="false" aria-labelledby={gameoverMinimized ? undefined : "victory-title"} aria-label={gameoverMinimized ? "Battle results minimized" : undefined} onPointerDown={(event) => event.stopPropagation()}>{gameoverMinimized ? <><button className="gameover-expand" type="button" aria-label="Expand battle results" onClick={toggleGameoverPanel}>▣ <span>RESULTS</span></button><button className="gameover-new-match" type="button" onClick={resetToSetup}>New Match</button></> : <><button className="gameover-minimize" type="button" aria-label="Minimize battle results" onClick={toggleGameoverPanel}>▁</button><p className="eyebrow">Battle record complete</p><h2 id="victory-title">{game.draw ? "Draw." : `Commander ${game.winner! + 1} wins.`}</h2><p>{baseOnlyDraw ? "All ships and torpedoes are gone; the surviving bases cannot engage." : game.draw ? "No controllable assets remain on either side." : "The opposing commander has no controllable assets remaining."}</p><dl className="battle-stats"><div><dt>Rounds</dt><dd>{game.turn}</dd></div><div><dt>Ships deployed</dt><dd>{matchStats.deployed}</dd></div><div><dt>Ships lost</dt><dd>{matchStats.shipsLost}</dd></div><div><dt>Lasers fired</dt><dd>{matchStats.lasers}</dd></div><div><dt>Torpedoes fired</dt><dd>{matchStats.torpedoes}</dd></div><div><dt>Impact marks</dt><dd>{matchStats.impacts}</dd></div></dl><div className="gameover-actions"><button autoFocus type="button" onClick={startReplay}>Watch replay</button><button type="button" onClick={toggleGameoverPanel}>Minimize</button><button type="button" onClick={resetToSetup}>New match</button></div></>}</section>}
           {replayActive && <div className="replay-controls" role="status"><span>Battle replay</span><button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={stopReplay}>Stop replay</button></div>}
         </div>
 
@@ -3077,7 +3186,7 @@ function GraphiteFleet() {
           <p className="eyebrow">Fleet Rules · Match setup</p>
           <h2 id="setup-title">Graphite Fleet</h2>
           <p id="setup-description" className="setup-description">Gravity and persistent inertia are always active. Choose a local two-player match or face the CPU, then set the fleet size and commander colors. Every deployed ship and each base receives one action per round.</p>
-          <p className="game-credit">Graphite Fleet is an independent, noncommercial adaptation. Inspired by a traditional pencil-and-paper space-combat game passed between classrooms and friends, professors and students. <strong>Thank you, Professor Armstrong.</strong></p>
+          <p className="game-credit">Graphite Fleet is an open source adaptation, inspired by a traditional pencil-and-paper space-combat game passed between classrooms and friends, professors and students. <strong>Thank you, Professor A.</strong></p>
 
           <fieldset className="rule-fieldset">
             <legend>Opponent</legend>
@@ -3103,7 +3212,7 @@ function GraphiteFleet() {
                 })}</div></fieldset>)}
           </div>
 
-          <p className="mobile-start-note">Best played on a desktop, or on a phone or tablet held horizontally.</p>
+          <p className="mobile-start-note">Best played on a laptop or desktop, with a friend.</p>
           <p className="setup-note">All ships begin inside the base with 3 HP each. Filled ships have 3 HP, half-filled ships 2 HP, and open ships 1 HP. Base HP equals the total HP of undeployed ships plus one core HP. Lasers deal 1 HP; torpedoes and collisions deal 2 HP.</p>
           <div className="setup-footer"><p><strong>ASSET COMMAND</strong><span>{settingsDraft.opponent === "cpu" ? "vs CPU" : "local 2-player"} · {settingsDraft.fleetSize} ships · one action per asset</span></p><button className="start-battle" type="button" onClick={startBattle}>Begin battle</button></div>
         </div>
@@ -3111,4 +3220,4 @@ function GraphiteFleet() {
       <div className="rotate-notice" role="status"><strong>Rotate to play</strong><span>Graphite Fleet is best played on desktop or in horizontal orientation.</span></div>
     </main>);
 }
-export default GraphiteFleet;
+export default GamePrototype;
