@@ -26,6 +26,11 @@ button { font: inherit; }
 .battlefield-wrap { position: relative; min-width: 0; min-height: 0; overflow: hidden; overscroll-behavior: none; background: #10171c; touch-action: none; }
 .battlefield { position: absolute; inset: 0; display: block; width: 100%; height: 100%; overscroll-behavior: none; background: #10171c; cursor: crosshair; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .battlefield:focus-visible { outline: 3px solid var(--cyan); outline-offset: -4px; }
+.asset-action-palette { position: absolute; z-index: 6; inset: 0; pointer-events: none; touch-action: none; }
+.asset-action-palette button { position: absolute; min-width: 0; min-height: 44px; padding: .42rem .25rem; border-color: color-mix(in srgb,var(--cyan) 72%,#fff 28%); background: rgba(13,21,26,.97); box-shadow: 0 7px 20px rgba(0,0,0,.45); font-size: .5rem; letter-spacing: .04em; pointer-events: auto; touch-action: none; opacity: 0; animation: palette-grow .18s cubic-bezier(.2,.85,.25,1.15) forwards; transform-origin: center; }
+.asset-action-palette button:disabled { opacity: .72; color: #9ba9ad; background: rgba(12,19,24,.97); }
+.asset-action-palette .no-change { color: var(--muted); border-style: dashed; background: rgba(11,18,22,.97); }
+@keyframes palette-grow { from { opacity: 0; transform: scale(.35); } to { opacity: 1; transform: scale(1); } }
 [data-theme="dark"] .battlefield-wrap, [data-theme="dark"] .battlefield { background: #10171c; }
 [data-theme="dark"] .resolve-banner, [data-theme="dark"] .cpu-banner { border-color: rgba(210,225,223,.28); color: #d4dfdd; background: rgba(16,23,28,.88); }
 .resolve-banner, .cpu-banner { position: absolute; z-index: 4; left: 50%; top: .75rem; transform: translateX(-50%); padding: .4rem .7rem; border: 1px solid rgba(22,30,34,.35); color: #20282c; background: rgba(238,234,224,.92); font-size: .58rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; pointer-events: none; }
@@ -84,10 +89,11 @@ button.ghost-active { border-color: var(--cyan); color: var(--cyan); }
 .commit-row { display: grid; grid-template-columns: 1fr auto; gap: .42rem; margin-top: .45rem; }
 .commit-button { background: var(--cyan); border-color: var(--cyan); color: #fff; }
 .commit-button:hover:not(:disabled) { background: color-mix(in srgb,var(--cyan) 82%,white); border-color: color-mix(in srgb,var(--cyan) 82%,white); }
+.master-commit { background: repeating-linear-gradient(135deg,color-mix(in srgb,var(--cyan) 88%,#111 12%) 0 10px,color-mix(in srgb,var(--cyan) 58%,#0a0f13 42%) 10px 20px); border-color: color-mix(in srgb,var(--cyan) 88%,white); text-shadow: 0 1px 2px rgba(0,0,0,.72); }
+.master-commit:hover:not(:disabled) { background: repeating-linear-gradient(135deg,color-mix(in srgb,var(--cyan) 94%,white 6%) 0 10px,color-mix(in srgb,var(--cyan) 68%,#0a0f13 32%) 10px 20px); }
 .first-turn-hint { margin: .65rem 0 .35rem; padding: .42rem .5rem; border: 1px solid #ffd24f; color: #ffe17e; background: rgba(255,210,79,.08); font-size: .54rem; font-weight: 900; letter-spacing: .08em; text-align: center; }
 .commit-button.needs-commit { border-color: #ffd24f; animation: commit-pulse 1.25s ease-in-out infinite; }
 @keyframes commit-pulse { 0%,100% { box-shadow: 0 0 0 1px rgba(255,210,79,.58),0 0 0 rgba(255,210,79,0); } 50% { box-shadow: 0 0 0 4px rgba(255,210,79,.95),0 0 18px rgba(255,210,79,.58); } }
-.finish-planning { width: 100%; margin-top: .42rem; border-style: dashed; color: #d7e2e0; background: transparent; }
 .vector-plotter { min-width: 0; margin: .72rem 0 0; border: 1px solid #35464e; }
 .vector-plotter summary { min-height: 44px; display: flex; align-items: center; padding: .55rem .6rem; color: #dce7e5; font-size: .54rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; cursor: pointer; }
 .vector-plotter summary::before { content: "+"; width: 1.2rem; color: var(--cyan); font-size: .8rem; }
@@ -144,13 +150,12 @@ input[type="range"]:disabled { opacity: .4; cursor: not-allowed; }
 .game-credit strong { color: #e6eeee; font-weight: 700; }
 .rule-fieldset { margin: 0; padding: .85rem 0; border: 0; border-top: 1px solid var(--line); }
 .rule-fieldset legend { width: 100%; padding: .85rem 0 0; color: var(--cyan); font-size: .57rem; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
-.rule-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: .55rem; margin-top: .6rem; }
-.rule-choice { min-height: 92px; display: grid; align-content: center; gap: .35rem; padding: .8rem; text-align: left; text-transform: none; }
-.rule-choice span { font-size: .72rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.rule-choice small { color: #aab8bc; font: .7rem/1.4 var(--font-geist-sans),system-ui,sans-serif; letter-spacing: 0; }
-.rule-choice.active small { color: #d2dcda; }
-.color-picker-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; border-top: 1px solid var(--line); }
-.color-fieldset { border-top: 0; }
+.commander-roster { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; border-top: 1px solid var(--line); }
+.commander-seat { border-top: 0; }
+.seat-controller { display: grid; grid-template-columns: 1fr 1fr; margin-top: .5rem; }
+.seat-controller button { min-height: 42px; padding: .4rem .55rem; }
+.seat-controller button + button { border-left: 0; }
+.seat-controller button.active { border-color: var(--cyan); color: #fff; background: #26343a; box-shadow: inset 0 0 0 1px var(--cyan); }
 .color-options { display: grid; grid-template-columns: repeat(3,1fr); gap: .4rem; margin-top: .55rem; }
 .color-choice { min-height: 48px; display: flex; align-items: center; justify-content: flex-start; gap: .4rem; padding: .4rem; text-transform: none; }
 .color-choice.active { color: #fff; background: #26343a; box-shadow: inset 0 0 0 2px var(--color, #fff); }
@@ -191,9 +196,7 @@ input[type="range"]:disabled { opacity: .4; cursor: not-allowed; }
   .setup-description { margin-bottom: .7rem; }
   .rule-fieldset { padding: .5rem 0; }
   .rule-fieldset legend { padding-top: .5rem; }
-  .rule-toggle { grid-template-columns: 1fr; gap: .38rem; margin-top: .4rem; }
-  .rule-choice { min-height: 68px; padding: .62rem .7rem; }
-  .color-picker-grid { grid-template-columns: 1fr; gap: 0; }
+  .commander-roster { grid-template-columns: 1fr; gap: 0; }
   .color-options { grid-template-columns: repeat(3,1fr); }
   .color-choice { min-height: 44px; font-size: .5rem; }
   .setup-note { display: none; }
