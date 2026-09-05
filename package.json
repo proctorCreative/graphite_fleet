@@ -1,8 +1,8 @@
 {
   "name": "graphite-fleet",
-  "version": "1.0.0",
+  "version": "1.0.52",
   "private": true,
-  "description": "An open source adaptation inspired by a traditional pencil-and-paper space-combat game.",
+  "description": "An open source browser adaptation of a traditional pencil-and-paper space-combat folk game.",
   "type": "module",
   "scripts": {
     "dev": "vite",
