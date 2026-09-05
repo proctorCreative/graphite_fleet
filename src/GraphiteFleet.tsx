@@ -14,7 +14,7 @@ type CpuSquadTactic = "focus" | "flank" | "pincer" | "rendezvous";
 type GameSettings = {
   gravity: true; inertia: true; actionsPerCommander: 1;
   theme: ThemeMode; colors: string[]; historyOpacity: number;
-  controllers: ControllerKind[];
+  controllers: ControllerKind[]; fleetSizes: number[];
 };
 type Unit = {
   id: string; player: number; kind: "ship" | "base"; label: string; baseId: string;
@@ -27,15 +27,16 @@ type Missile = {
 };
 type Asteroid = { id: string; orbitRadius: number; phase: number; r: number; direction: 1 | -1; alive: boolean; armor: number };
 type CommandSource = Unit | Missile;
-type PathEvent = { type: "path"; objectKind: "ship" | "torpedo"; objectId?: string; player: number; turn: number; points: Vec[]; phase?: number };
+type PathEvent = { type: "path"; objectKind: "ship" | "torpedo"; objectId?: string; player: number; turn: number; points: Vec[]; phase?: number; lead?: number; endPhase?: number };
 type LaserEvent = { type: "laser"; player: number; turn: number; from: Vec; to: Vec; hit?: boolean; phase?: number };
 type ImpactEvent = { type: "impact"; player: number; turn: number; pos: Vec; heavy?: boolean; phase?: number };
 type MarkerEvent = { type: "marker"; player: number; turn: number; pos: Vec; label: string };
 type DestroyEvent = { type: "destroy"; player: number; turn: number; pos: Vec; label: string; base?: boolean; phase?: number };
 type RockDestroyEvent = { type: "rock-destroy"; player: number; turn: number; pos: Vec; label: string; phase?: number };
-type BaseStatusEvent = { type: "base-status"; player: number; baseId: string; turn: number; pos: Vec; baseArmor: number; shipArmors: number[] };
+type BaseStatusEvent = { type: "base-status"; player: number; baseId: string; turn: number; pos: Vec; baseArmor: number; shipArmors: number[]; phase?: number };
+type TurnTimingEvent = { type: "turn-timing"; player: number; turn: number; lead: number };
 type DamageEvent = { type: "damage"; player: number; turn: number; pos: Vec; id: string; armor: number; objectKind: "ship" | "base" | "asteroid"; phase?: number };
-type HistoryEvent = PathEvent | LaserEvent | ImpactEvent | MarkerEvent | DestroyEvent | RockDestroyEvent | BaseStatusEvent | DamageEvent;
+type HistoryEvent = PathEvent | LaserEvent | ImpactEvent | MarkerEvent | DestroyEvent | RockDestroyEvent | BaseStatusEvent | DamageEvent | TurnTimingEvent;
 type PendingOrder = {
   player: number; sourceId: string; action: ActionKind; vector: Vec; markerPos: Vec;
   actorId: string;
@@ -79,8 +80,7 @@ const BASE_RING_R = 1500;
 // direct base-to-base fire.
 const BASE_LASER_MAX = 1260;
 const COMMANDER_COUNT = 2;
-const FLEET_SIZE = 6;
-const BASE_STARTING_HP = FLEET_SIZE * 3 + 1;
+const MAX_FLEET_SIZE = 6;
 const SHIP_LASER_MAX = 1160 * 2 / 3;
 const INTERVAL = 6;
 const STEP = 0.06;
@@ -99,7 +99,7 @@ const COLOR_OPTIONS = [
   { name: "Plum", value: "#9a4b83" }, { name: "Teal", value: "#168b8b" },
 ];
 const CENTRAL = { x: 1500, y: 1500, r: 180, mu: 820000 };
-const DEFAULT_SETTINGS: GameSettings = { gravity: true, inertia: true, actionsPerCommander: 1, theme: "dark", colors: DEFAULT_COLORS.slice(0, COMMANDER_COUNT), historyOpacity: 2, controllers: ["human", "cpu"] };
+const DEFAULT_SETTINGS: GameSettings = { gravity: true, inertia: true, actionsPerCommander: 1, theme: "dark", colors: DEFAULT_COLORS.slice(0, COMMANDER_COUNT), historyOpacity: 2, controllers: ["human", "cpu"], fleetSizes: [6, 6] };
 const HISTORY_LEVELS = [0, .22, .45, .68] as const;
 const HISTORY_LABELS = ["Off", "Faint", "Medium", "Full"] as const;
 // The former largest setting (1.3×) is now the midpoint. This makes the whole
@@ -116,6 +116,9 @@ const colorsForCommanders = (colors: string[]) => {
   return result.slice(0, COMMANDER_COUNT);
 };
 const controllersForCommanders = (controllers: ControllerKind[]) => Array.from({ length: COMMANDER_COUNT }, (_, player) => controllers[player] ?? (player === 0 ? "human" : "cpu"));
+const fleetSizesForCommanders = (fleetSizes: number[]) => Array.from({ length: COMMANDER_COUNT }, (_, player) => clamp(Math.round(fleetSizes[player] ?? MAX_FLEET_SIZE), 1, MAX_FLEET_SIZE));
+const fleetSizeFor = (settings: GameSettings, player: number) => fleetSizesForCommanders(settings.fleetSizes)[player];
+const baseStartingHpFor = (settings: GameSettings, player: number) => fleetSizeFor(settings, player) * 3 + 1;
 const cloneVec = (v: Vec): Vec => ({ x: v.x, y: v.y });
 const add = (a: Vec, b: Vec): Vec => ({ x: a.x + b.x, y: a.y + b.y });
 const sub = (a: Vec, b: Vec): Vec => ({ x: a.x - b.x, y: a.y - b.y });
@@ -143,6 +146,13 @@ const hexRgb = (hex: string) => { const n = Number.parseInt(hex.slice(1), 16); r
 const rotateVec = (v: Vec, radians: number): Vec => ({ x: v.x * Math.cos(radians) - v.y * Math.sin(radians), y: v.x * Math.sin(radians) + v.y * Math.cos(radians) });
 const hash01 = (text: string) => { let h = 2166136261; for (let i = 0; i < text.length; i += 1) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) / 4294967295; };
 const resolutionMotionProgress = (resolution: Resolution) => clamp((resolution.progress - resolution.lead) / Math.max(.001, 1 - resolution.lead), 0, 1);
+const historyEventTime = (event: HistoryEvent) => event.turn - 1 + ("phase" in event ? event.phase ?? (event.type === "base-status" ? 1 : 0) : 0);
+const turnLeadFor = (game: Game, turn: number) => game.history.find((event): event is TurnTimingEvent => event.type === "turn-timing" && event.turn === turn)?.lead ?? 0;
+const replayFrame = (game: Game, progress: number) => {
+  const maxTurn = Math.max(1, ...game.history.map((event) => event.turn)); const replayTurn = clamp(progress, 0, 1) * maxTurn;
+  const turn = clamp(Math.floor(Math.min(replayTurn, maxTurn - .0001)) + 1, 1, maxTurn); const local = replayTurn >= maxTurn ? 1 : clamp(replayTurn - Math.floor(replayTurn), 0, 1); const lead = turnLeadFor(game, turn);
+  return { maxTurn, replayTurn, turn, local, lead, motionLocal: clamp((local - lead) / Math.max(.001, 1 - lead), 0, 1) };
+};
 const generateMatchSeed = () => ((Date.now() ^ Math.floor(performance.now() * 1000)) >>> 0) % 1_000_000 || 1;
 
 function asteroidLayout(matchSeed: number): Asteroid[] {
@@ -217,6 +227,7 @@ function createGame(settings: GameSettings = DEFAULT_SETTINGS, phase: Phase = "s
     ...settings,
     controllers: controllersForCommanders(settings.controllers),
     colors: colorsForCommanders(settings.colors),
+    fleetSizes: fleetSizesForCommanders(settings.fleetSizes),
     actionsPerCommander: 1,
   };
   const units: Unit[] = [];
@@ -225,8 +236,8 @@ function createGame(settings: GameSettings = DEFAULT_SETTINGS, phase: Phase = "s
     const angle = Math.PI + player * Math.PI;
     const pos = { x: CENTRAL.x + Math.cos(angle) * BASE_RING_R, y: CENTRAL.y + Math.sin(angle) * BASE_RING_R };
     const baseId = `p${player}-b1`;
-    units.push({ id: baseId, baseId, player, kind: "base", label: `${prefix}-BASE`, pos, vel: { x: 0, y: 0 }, r: 52, alive: true, deployed: true, armor: BASE_STARTING_HP, fuel: 0, missiles: 0, laserCooldown: 0, heading: angle + Math.PI });
-    Array.from({ length: FLEET_SIZE }).forEach((__, shipIndex) => {
+    units.push({ id: baseId, baseId, player, kind: "base", label: `${prefix}-BASE`, pos, vel: { x: 0, y: 0 }, r: 52, alive: true, deployed: true, armor: baseStartingHpFor(normalizedSettings, player), fuel: 0, missiles: 0, laserCooldown: 0, heading: angle + Math.PI });
+    Array.from({ length: fleetSizeFor(normalizedSettings, player) }).forEach((__, shipIndex) => {
       units.push({ id: `p${player}-b1-s${shipIndex + 1}`, baseId, player, kind: "ship", label: `${prefix}-${shipIndex + 1}`, pos: cloneVec(pos), vel: { x: 0, y: 0 }, r: 22, alive: true, deployed: false, armor: 3, fuel: Number.POSITIVE_INFINITY, missiles: 4, laserCooldown: 0, heading: angle + Math.PI });
     });
   });
@@ -258,7 +269,7 @@ function createGame(settings: GameSettings = DEFAULT_SETTINGS, phase: Phase = "s
       `MATCH SEED ${String(matchSeed).padStart(6, "0")}.`,
       "COMMANDER 1 has initiative.",
       "Each deployed ship and each base receives one editable plan per round.",
-      `Each base stores ${FLEET_SIZE} ships.`,
+      `Commander fleets: ${normalizedSettings.fleetSizes.map((size, player) => `Commander ${player + 1} has ${size}`).join("; ")} ships.`,
       "Ships coast and bases take no action until assigned orders.",
       "Committed orders are sealed from the opposing commander.",
       "Base HP equals its stored ship HP plus one core HP.",
@@ -277,6 +288,7 @@ function cloneGame(game: Game): Game {
       ...game.settings,
       colors: [...game.settings.colors],
       controllers: [...game.settings.controllers],
+      fleetSizes: [...game.settings.fleetSizes],
     },
     planningComplete: [...game.planningComplete],
     units: game.units.map((unit) => ({ ...unit, pos: cloneVec(unit.pos), vel: cloneVec(unit.vel) })),
@@ -325,7 +337,6 @@ function actorForSource(game: Game, source: CommandSource): Unit | undefined {
 
 function actorHasOrder(game: Game, actorId: string) { return game.pendingOrders.some((order) => order.actorId === actorId); }
 function draftForActor(game: Game, actorId: string) { return game.pendingOrders.find((order) => order.actorId === actorId); }
-function actorHasActivePlan(game: Game, actorId: string) { const draft = draftForActor(game, actorId); return Boolean(draft && draft.action !== "NONE"); }
 function orderIsVisible(game: Game, order: PendingOrder) {
   return order.player === game.currentPlayer || game.phase === "resolving" || game.phase === "gameover";
 }
@@ -400,7 +411,7 @@ function applyDamage(game: Game, target: Unit, attacker: number, events: History
       const stored = reserveShipsFor(game, target.player, target.id)[0];
       if (stored) {
         stored.armor = Math.max(0, stored.armor - 1);
-        if (stored.armor === 0) { stored.alive = false; game.log.unshift(`${stored.label} destroyed inside ${target.label} by ${label}.`); }
+        if (stored.armor === 0) { stored.alive = false; events.push({ type: "destroy", player: stored.player, turn: game.turn, pos: cloneVec(target.pos), label: stored.label }); game.log.unshift(`${stored.label} destroyed inside ${target.label} by ${label}.`); }
         else game.log.unshift(`${stored.label} damaged inside ${target.label}; ${stored.armor} stored HP remains.`);
       }
       target.armor -= 1;
@@ -750,8 +761,8 @@ function cpuChoiceForActor(game: Game, actor: Unit): CpuChoice | null {
       const aim = sub(laserTarget.pos, actor.pos); const shot = actionVector("LASER", aim, 1, actor); const hit = lineTarget(game, actor.pos, add(actor.pos, shot), actor);
       if (cpuHitIsEnemy(game, hit, actor.player)) return { sourceId: actor.id, action: "LASER", raw: mul(unitVec(aim), MAX_VECTOR_INPUT), power: 1, note: `${actor.label} is calculating a long-range laser shot on ${laserTarget.label}.` };
     }
-    const reserves = reserveShipsFor(game, actor.player, actor.id); const deployed = game.units.filter((unit) => unit.kind === "ship" && unit.alive && unit.deployed && unit.baseId === actor.id).length; const deploymentGoal = Math.max(2, Math.ceil(FLEET_SIZE / 2));
-    const doctrineGoal = doctrine === "raider" ? FLEET_SIZE : doctrine === "hunter" ? Math.ceil(FLEET_SIZE * .75) : doctrine === "screen" ? 2 : deploymentGoal;
+    const fleetSize = fleetSizeFor(game.settings, actor.player); const reserves = reserveShipsFor(game, actor.player, actor.id); const deployed = game.units.filter((unit) => unit.kind === "ship" && unit.alive && unit.deployed && unit.baseId === actor.id).length; const deploymentGoal = Math.max(1, Math.ceil(fleetSize / 2));
+    const doctrineGoal = Math.min(fleetSize, doctrine === "raider" ? fleetSize : doctrine === "hunter" ? Math.ceil(fleetSize * .75) : doctrine === "screen" ? 2 : deploymentGoal);
     if (reserves.length && deployed < doctrineGoal) {
       const lane = (hash01(`${game.matchSeed}:${reserves[0].id}:deployment-lane`) - .5) * .5;
       const orbital = rotateVec(cpuOrbitalVelocity(game, actor), lane); const vector = cpuSafeVector(game, actor, "DEPLOY", orbital, doctrine === "raider" ? 1 : .82);
@@ -874,7 +885,7 @@ function GamePrototype() {
   const [viewMode, setViewMode] = useState<ViewMode>("tactical");
   const [power, setPower] = useState(.45);
   const [vectorView, setVectorView] = useState<Vec>({ x: 1, y: 0 });
-  const [settingsDraft, setSettingsDraft] = useState<GameSettings>({ ...DEFAULT_SETTINGS, colors: [...DEFAULT_SETTINGS.colors], controllers: [...DEFAULT_SETTINGS.controllers] });
+  const [settingsDraft, setSettingsDraft] = useState<GameSettings>({ ...DEFAULT_SETTINGS, colors: [...DEFAULT_SETTINGS.colors], controllers: [...DEFAULT_SETTINGS.controllers], fleetSizes: [...DEFAULT_SETTINGS.fleetSizes] });
   const [liveMessage, setLiveMessage] = useState("Choose the two commanders.");
   const [replayActive, setReplayActive] = useState(false);
   const [gameoverMinimized, setGameoverMinimized] = useState(false);
@@ -986,17 +997,20 @@ function GamePrototype() {
   }, [screenToWorld, worldToScreen]);
 
   const drawHistory = useCallback((ctx: CanvasRenderingContext2D, camera: Camera, mode: ViewMode) => {
-    const game = gameRef.current; const replay = replayRef.current; const maxTurn = Math.max(1, ...game.history.map((event) => event.turn)); const replayTurn = replay.progress * maxTurn;
+    const game = gameRef.current; const replay = replayRef.current; const frame = replayFrame(game, replay.progress); const replayTurn = frame.replayTurn;
     const tacticalOpacity = HISTORY_LEVELS[game.settings.historyOpacity] ?? 0;
     if (mode !== "history" && tacticalOpacity <= 0) return;
     const dark = game.settings.theme === "dark"; const graphiteRgb = dark ? "205,216,214" : "49,53,54";
     game.history.forEach((event) => {
       const eventPhase = replay.active ? replayTurn - (event.turn - 1) : 1; if (eventPhase <= 0) return;
       if (replay.active && "phase" in event && event.phase !== undefined && eventPhase < event.phase) return;
+      if (event.type === "turn-timing") return;
       const age = Math.max(0, game.turn - event.turn); const opacityScale = tacticalOpacity / .68; const recordAlpha = clamp(.86 - age * .018, .32, .86);
       const alpha = replay.active ? recordAlpha * opacityScale : mode === "history" ? recordAlpha : clamp(.68 - age * .06, .12, .68) * opacityScale;
       if (event.type === "path") {
-        const visibleCount = replay.active ? Math.max(2, Math.ceil(event.points.length * clamp(eventPhase, 0, 1))) : event.points.length;
+        const pathLead = event.lead ?? turnLeadFor(game, event.turn); const pathProgress = clamp((eventPhase - pathLead) / Math.max(.001, 1 - pathLead), 0, 1);
+        if (replay.active && eventPhase < pathLead) return;
+        const visibleCount = replay.active ? Math.max(2, Math.ceil(event.points.length * pathProgress)) : event.points.length;
         const visiblePoints = event.points.slice(0, visibleCount); if (visiblePoints.length < 2) return; ctx.save();
         const trailRgb = hexRgb(game.settings.colors[event.player]); const trailAlpha = event.objectKind === "torpedo" ? alpha : alpha * (dark ? .82 : .68);
         ctx.strokeStyle = `rgba(${trailRgb},${trailAlpha})`;
@@ -1004,7 +1018,8 @@ function GamePrototype() {
         ctx.beginPath(); visiblePoints.forEach((p, i) => { const s = worldToScreen(p, camera); if (i) ctx.lineTo(s.x, s.y); else ctx.moveTo(s.x, s.y); }); ctx.stroke(); ctx.setLineDash([]);
         for (let i = 8; i < visiblePoints.length; i += 12) { const p = worldToScreen(visiblePoints[i], camera); const q = worldToScreen(visiblePoints[i - 1], camera); const d = unitVec(sub(p, q)); const n = { x: -d.y, y: d.x }; ctx.fillStyle = `rgba(${trailRgb},${trailAlpha})`; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - d.x * 6 + n.x * 3, p.y - d.y * 6 + n.y * 3); ctx.lineTo(p.x - d.x * 6 - n.x * 3, p.y - d.y * 6 - n.y * 3); ctx.closePath(); ctx.fill(); }
         ctx.restore();
-      } else if (event.type === "laser") {
+      } else if (replay.active && (event.type === "laser" || event.type === "impact" || event.type === "rock-destroy" || event.type === "destroy")) return;
+      else if (event.type === "laser") {
         if (replay.active && eventPhase < .08) return;
         const a = worldToScreen(event.from, camera); const b = worldToScreen(event.to, camera); ctx.save();
         ctx.strokeStyle = `rgba(${hexRgb(game.settings.colors[event.player])},${clamp(alpha + .15, 0, 1)})`; ctx.lineWidth = age < 2 ? 2.8 : 1.5; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); ctx.restore();
@@ -1017,16 +1032,16 @@ function GamePrototype() {
         const p = worldToScreen(event.pos, camera); ctx.save(); ctx.fillStyle = `rgba(${graphiteRgb},${alpha})`; ctx.font = "700 9px ui-monospace,monospace"; ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = dark ? "#10171c" : PAPER; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(String(event.turn), p.x, p.y + .5); ctx.restore();
       } else if (event.type === "rock-destroy") {
         const p = worldToScreen(event.pos, camera); const burstProgress = replay.active && !reducedMotion.current ? clamp((eventPhase - (event.phase ?? 0)) * 5, 0, 1) : 1;
-        drawBaseDestruction(ctx, p, burstProgress, alpha, game.settings.colors[event.player], .58, false); ctx.save(); ctx.globalAlpha = alpha; ctx.font = "700 8px ui-monospace,monospace"; ctx.fillStyle = "#d9a071"; ctx.fillText(`${event.label} DESTROYED`, p.x + 22, p.y + 3); ctx.restore();
+        drawBaseDestruction(ctx, p, burstProgress, alpha, game.settings.colors[event.player], .58, false); ctx.save(); ctx.globalAlpha = alpha; ctx.font = "700 11px ui-monospace,monospace"; ctx.fillStyle = "#d9a071"; ctx.fillText(`${event.label} DESTROYED`, p.x + 22, p.y + 3); ctx.restore();
       } else if (event.type === "base-status" || event.type === "damage") return;
       else {
         const p = worldToScreen(event.pos, camera);
         if (event.base) {
           const burstProgress = replay.active && !reducedMotion.current ? clamp((eventPhase - (event.phase ?? 0)) * 4, 0, 1) : 1; drawBaseDestruction(ctx, p, burstProgress, alpha, game.settings.colors[event.player]);
-          ctx.save(); ctx.globalAlpha = alpha; ctx.font = "800 9px ui-monospace,monospace"; ctx.fillStyle = dark ? "#f08a64" : "#8e3027"; ctx.fillText(`${event.label} DESTROYED`, p.x + 48, p.y + 4); ctx.restore();
+          ctx.save(); ctx.globalAlpha = alpha; ctx.font = "800 12px ui-monospace,monospace"; ctx.fillStyle = dark ? "#f08a64" : "#8e3027"; ctx.fillText(`${event.label} DESTROYED`, p.x + 48, p.y + 4); ctx.restore();
         } else {
           const burstProgress = replay.active && !reducedMotion.current ? clamp((eventPhase - (event.phase ?? 0)) * 5, 0, 1) : 1;
-          drawBaseDestruction(ctx, p, burstProgress, alpha, game.settings.colors[event.player], .5, false); ctx.save(); ctx.globalAlpha = alpha; ctx.font = "700 8px ui-monospace,monospace"; ctx.fillStyle = game.settings.colors[event.player]; ctx.fillText(`${event.label} DESTROYED`, p.x + 20, p.y + 3); ctx.restore();
+          drawBaseDestruction(ctx, p, burstProgress, alpha, game.settings.colors[event.player], .5, false); ctx.save(); ctx.globalAlpha = alpha; ctx.font = "700 11px ui-monospace,monospace"; ctx.fillStyle = game.settings.colors[event.player]; ctx.fillText(`${event.label} DESTROYED`, p.x + 20, p.y + 3); ctx.restore();
         }
       }
     });
@@ -1034,8 +1049,9 @@ function GamePrototype() {
 
   const drawReplayMarkers = useCallback((ctx: CanvasRenderingContext2D, camera: Camera) => {
     const game = gameRef.current; const replay = replayRef.current; if (!replay.active || !game.history.length) return;
-    const maxTurn = Math.max(1, ...game.history.map((event) => event.turn)); const replayTurn = replay.progress * maxTurn; const turn = clamp(Math.floor(Math.min(replayTurn, maxTurn - .0001)) + 1, 1, maxTurn); const local = replayTurn >= maxTurn ? 1 : clamp(replayTurn - Math.floor(replayTurn), 0, 1);
+    const { replayTurn, turn, local: turnPhase, motionLocal: local } = replayFrame(game, replay.progress);
     game.history.filter((event): event is PathEvent => event.type === "path" && event.turn === turn && event.points.length > 1).forEach((event) => {
+      if (event.endPhase !== undefined && turnPhase >= event.endPhase) return;
       const unitLabel = event.objectId ? game.units.find((unit) => unit.id === event.objectId)?.label : undefined;
       const destroyed = Boolean(unitLabel && game.history.some((candidate) => candidate.type === "destroy" && candidate.player === event.player && (candidate.label === unitLabel || candidate.label.startsWith(`${unitLabel} `)) && candidate.turn - 1 + (candidate.phase ?? 0) <= replayTurn));
       if (destroyed) return;
@@ -1045,6 +1061,28 @@ function GamePrototype() {
       if (event.objectKind === "torpedo") { ctx.fillRect(-5, -2, 10, 4); ctx.beginPath(); ctx.moveTo(6, 0); ctx.lineTo(2, -4); ctx.lineTo(2, 4); ctx.closePath(); ctx.fill(); }
       else { const r = 10; const armor = game.history.filter((candidate): candidate is DamageEvent => candidate.type === "damage" && candidate.id === event.objectId && candidate.turn - 1 + (candidate.phase ?? 0) <= replayTurn).at(-1)?.armor ?? 3; const trace = () => { ctx.beginPath(); ctx.moveTo(r, 0); ctx.lineTo(-r * .72, r * .62); ctx.lineTo(-r * .45, 0); ctx.lineTo(-r * .72, -r * .62); ctx.closePath(); }; trace(); ctx.fillStyle = "#10171c"; ctx.fill(); if (armor >= 3) { trace(); ctx.fillStyle = color; ctx.fill(); } else if (armor === 2) { ctx.save(); trace(); ctx.clip(); ctx.fillStyle = color; ctx.fillRect(0, -r, r, r * 2); ctx.restore(); } trace(); ctx.stroke(); }
       ctx.restore();
+      if (event.objectKind === "ship" && unitLabel) { ctx.save(); ctx.font = "700 11px ui-monospace,monospace"; ctx.fillStyle = color; ctx.fillText(unitLabel, p.x + 13, p.y - 12); ctx.restore(); }
+    });
+  }, [worldToScreen]);
+
+  const drawReplayEffects = useCallback((ctx: CanvasRenderingContext2D, camera: Camera) => {
+    const game = gameRef.current; const replay = replayRef.current; if (!replay.active) return;
+    const { maxTurn, replayTurn } = replayFrame(game, replay.progress); const turnMs = replay.duration / maxTurn;
+    game.history.forEach((event) => {
+      if (event.type !== "laser" && event.type !== "impact" && event.type !== "destroy" && event.type !== "rock-destroy") return;
+      const elapsed = replayTurn - historyEventTime(event); if (elapsed < 0) return;
+      const age = Math.max(0, game.turn - event.turn); const alpha = clamp(.9 - age * .012, .42, .9);
+      if (event.type === "laser") {
+        if (elapsed > Math.max(.16, 220 / turnMs)) return; const a = worldToScreen(event.from, camera); const b = worldToScreen(event.to, camera); ctx.save(); ctx.strokeStyle = `rgba(${hexRgb(game.settings.colors[event.player])},${alpha})`; ctx.lineWidth = 2.8; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        if (event.hit === false) { ctx.beginPath(); ctx.arc(b.x, b.y, 4.5, 0, Math.PI * 2); ctx.stroke(); } ctx.restore(); return;
+      }
+      if (event.type === "impact") {
+        if (elapsed > Math.max(.2, 260 / turnMs)) return; const p = worldToScreen(event.pos, camera); const r = event.heavy ? 13 : 8; ctx.save(); ctx.strokeStyle = `rgba(255,116,79,${alpha * (1 - clamp(elapsed / Math.max(.2, 260 / turnMs), 0, 1))})`; ctx.lineWidth = 1.8;
+        for (let i = 0; i < 8; i += 1) { const a = i * Math.PI / 4; ctx.beginPath(); ctx.moveTo(p.x + Math.cos(a) * 2, p.y + Math.sin(a) * 2); ctx.lineTo(p.x + Math.cos(a) * r, p.y + Math.sin(a) * r); ctx.stroke(); } ctx.restore(); return;
+      }
+      const windowTurns = Math.max(.32, 420 / turnMs); const progress = reducedMotion.current ? 1 : clamp(elapsed / windowTurns, 0, 1); const p = worldToScreen(event.pos, camera); const isBase = event.type === "destroy" && Boolean(event.base); const scale = event.type === "rock-destroy" ? .58 : isBase ? 1 : .5;
+      drawBaseDestruction(ctx, p, progress, alpha, game.settings.colors[event.player], scale, isBase);
+      ctx.save(); ctx.globalAlpha = alpha; ctx.font = `800 ${isBase ? 12 : 11}px ui-monospace,monospace`; ctx.fillStyle = event.type === "rock-destroy" ? "#d9a071" : game.settings.colors[event.player]; ctx.fillText(`${event.label} DESTROYED`, p.x + (isBase ? 48 : 22), p.y + 4); ctx.restore();
     });
   }, [worldToScreen]);
 
@@ -1068,7 +1106,7 @@ function GamePrototype() {
       const radial = unitVec(sub(pos, CENTRAL)); const tangent = mul({ x: -radial.y, y: radial.x }, asteroid.direction); ctx.save(); ctx.strokeStyle = vectorStroke; ctx.fillStyle = vectorStroke; ctx.lineWidth = dark ? 1.7 : 1.2;
       const arrowStart = add(p, mul(tangent, r + 4)); const arrowEnd = add(arrowStart, mul(tangent, 12)); const normal = { x: -tangent.y, y: tangent.x };
       ctx.beginPath(); ctx.moveTo(arrowStart.x, arrowStart.y); ctx.lineTo(arrowEnd.x, arrowEnd.y); ctx.stroke(); ctx.beginPath(); ctx.moveTo(arrowEnd.x, arrowEnd.y); ctx.lineTo(arrowEnd.x - tangent.x * 5 + normal.x * 2.5, arrowEnd.y - tangent.y * 5 + normal.y * 2.5); ctx.lineTo(arrowEnd.x - tangent.x * 5 - normal.x * 2.5, arrowEnd.y - tangent.y * 5 - normal.y * 2.5); ctx.closePath(); ctx.fill();
-      ctx.font = "700 8px ui-monospace,monospace"; ctx.fillStyle = rockLabel; ctx.fillText(asteroid.id, p.x + r + 5, p.y - r - 3); ctx.restore();
+      ctx.font = "700 11px ui-monospace,monospace"; ctx.fillStyle = rockLabel; ctx.fillText(asteroid.id, p.x + r + 6, p.y - r - 4); ctx.restore();
     });
   }, [worldToScreen]);
 
@@ -1083,11 +1121,11 @@ function GamePrototype() {
     };
     ctx.save(); ctx.translate(p.x, p.y); ctx.globalAlpha = muted ? .45 : 1;
     const liveGame = gameRef.current;
-    const unassigned = !muted && (liveGame.phase === "ready" || liveGame.phase === "aiming") && u.player === liveGame.currentPlayer && !actorHasActivePlan(liveGame, u.id);
-    const awaiting = unassigned;
-    if (awaiting) { ctx.save(); ctx.strokeStyle = "#ffd24f"; ctx.lineWidth = 1.6; ctx.setLineDash([5, 5]); ctx.beginPath(); ctx.arc(0, 0, r + 14, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
-    const committed = !muted && (liveGame.phase === "ready" || liveGame.phase === "aiming") && actorHasActivePlan(liveGame, u.id);
-    if (committed) { ctx.save(); ctx.strokeStyle = "#54d77b"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, r + 14, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+    const planningForUnit = !muted && (liveGame.phase === "ready" || liveGame.phase === "aiming") && u.player === liveGame.currentPlayer;
+    const awaiting = planningForUnit && !actorHasOrder(liveGame, u.id);
+    const planned = planningForUnit && actorHasOrder(liveGame, u.id);
+    if (awaiting) { const pulse = (Math.sin(performance.now() / 420) + 1) / 2; ctx.save(); ctx.strokeStyle = `rgba(255,210,79,${.72 + pulse * .28})`; ctx.lineWidth = 2 + pulse * 1.2; ctx.setLineDash([6, 5]); ctx.beginPath(); ctx.arc(0, 0, r + 14 + pulse * 2, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+    if (planned) { ctx.save(); ctx.strokeStyle = "#54d77b"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, r + 14, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
     if (!muted && liveGame.selectedId === u.id && (liveGame.phase === "ready" || liveGame.phase === "aiming")) { ctx.save(); ctx.strokeStyle = "#ffd24f"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, r + 9, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
     if (u.kind === "base") {
       ctx.strokeStyle = color; ctx.fillStyle = field; ctx.lineWidth = 2.3; ctx.beginPath();
@@ -1095,14 +1133,14 @@ function GamePrototype() {
       ctx.closePath(); ctx.fill(); ctx.stroke();
       const storedShipArmors = storedArmorOverride ?? gameRef.current.units.filter((ship) => ship.kind === "ship" && ship.alive && !ship.deployed && ship.baseId === u.id).map((ship) => ship.armor);
       for (let i = 0; i < storedShipArmors.length; i += 1) {
-        const a = -Math.PI / 2 + i * Math.PI * 2 / FLEET_SIZE; const cx = Math.cos(a) * r * .5; const cy = Math.sin(a) * r * .5; const size = Math.max(5, r * .25);
+        const a = -Math.PI / 2 + i * Math.PI * 2 / fleetSizeFor(liveGame.settings, u.player); const cx = Math.cos(a) * r * .5; const cy = Math.sin(a) * r * .5; const size = Math.max(5, r * .25);
         ctx.save(); ctx.translate(cx, cy); ctx.rotate(a + Math.PI); ctx.lineWidth = 1.4; paintShip(size, storedShipArmors[i]); ctx.restore();
       }
       ctx.fillStyle = color; ctx.beginPath(); ctx.arc(0, 0, Math.max(3, r * .11), 0, Math.PI * 2); ctx.fill();
     }
     else { ctx.rotate(heading); ctx.lineWidth = 2.2; paintShip(r, u.armor); }
-    ctx.restore(); ctx.save(); ctx.font = "700 9px ui-monospace,monospace"; ctx.fillStyle = color; ctx.fillText(u.label, p.x + r + 5, p.y - r - 2);
-    if (unassigned) { ctx.font = "800 8px ui-monospace,monospace"; ctx.fillStyle = "#ffd24f"; ctx.fillText(u.kind === "ship" ? "COAST" : "NO ACTION", p.x + r + 5, p.y - r + 10); }
+    ctx.restore(); ctx.save(); ctx.font = "700 12px ui-monospace,monospace"; ctx.fillStyle = color; ctx.fillText(u.label, p.x + r + 6, p.y - r - 3);
+    if (awaiting) { ctx.font = "800 10px ui-monospace,monospace"; ctx.fillStyle = "#ffd24f"; ctx.fillText("READY FOR ORDERS", p.x + r + 6, p.y - r + 11); }
     ctx.restore();
   }, [worldToScreen]);
 
@@ -1121,7 +1159,7 @@ function GamePrototype() {
       const trajectory = order.arrivalPath?.length ? order.arrivalPath : [ship.pos, order.arrivalPos];
       ctx.save(); ctx.globalAlpha = dark ? .9 : .72; ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.setLineDash([6, 5]); ctx.beginPath(); trajectory.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke();
       ctx.translate(to.x, to.y); ctx.rotate(heading); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(r, 0); ctx.lineTo(-r * .72, r * .62); ctx.lineTo(-r * .45, 0); ctx.lineTo(-r * .72, -r * .62); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
-      ctx.rotate(-heading); ctx.font = "800 8px ui-monospace,monospace"; ctx.fillStyle = color; ctx.fillText(order.arrivalDoomed ? `GHOST ${ship.label} · IMPACT` : `GHOST ${ship.label}`, r + 5, -r - 3); ctx.restore();
+      ctx.rotate(-heading); ctx.font = "800 10px ui-monospace,monospace"; ctx.fillStyle = color; ctx.fillText(order.arrivalDoomed ? `GHOST ${ship.label} · IMPACT` : `GHOST ${ship.label}`, r + 6, -r - 4); ctx.restore();
     });
   }, [worldToScreen]);
 
@@ -1139,9 +1177,9 @@ function GamePrototype() {
           const size = 9; const gap = 3; const mark = () => { ctx.beginPath(); [[-size,-size,-gap,-gap],[gap,gap,size,size],[size,-size,gap,-gap],[-gap,gap,-size,size]].forEach(([x1,y1,x2,y2]) => { ctx.moveTo(end.x + x1, end.y + y1); ctx.lineTo(end.x + x2, end.y + y2); }); ctx.stroke(); };
           ctx.strokeStyle = "#10171c"; ctx.lineWidth = 4.5; mark(); ctx.strokeStyle = "#ffd24f"; ctx.lineWidth = 2.2; mark(); ctx.fillStyle = "#ffe17e";
         } else { ctx.beginPath(); ctx.arc(end.x, end.y, 4, 0, Math.PI * 2); ctx.stroke(); }
-        ctx.font = "800 8px ui-monospace,monospace"; ctx.fillText(`${source.label} AIM`, end.x + 5, end.y - 5);
+        ctx.font = "800 10px ui-monospace,monospace"; ctx.fillText(`${source.label} AIM`, end.x + 6, end.y - 6);
       } else {
-        const input = draftInput(game, source); const preview = previewPath(game, source, "TORPEDO", input.raw, input.power); ctx.setLineDash([5, 6]); ctx.lineWidth = 1.4; ctx.beginPath(); preview.points.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke(); ctx.setLineDash([]); const end = worldToScreen(preview.points.at(-1) ?? source.pos, camera); ctx.beginPath(); ctx.arc(end.x, end.y, 4, 0, Math.PI * 2); ctx.stroke(); ctx.font = "800 8px ui-monospace,monospace"; ctx.fillText("TORPEDO", end.x + 6, end.y - 5);
+        const input = draftInput(game, source); const preview = previewPath(game, source, "TORPEDO", input.raw, input.power); ctx.setLineDash([5, 6]); ctx.lineWidth = 1.4; ctx.beginPath(); preview.points.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke(); ctx.setLineDash([]); const end = worldToScreen(preview.points.at(-1) ?? source.pos, camera); ctx.beginPath(); ctx.arc(end.x, end.y, 4, 0, Math.PI * 2); ctx.stroke(); ctx.font = "800 10px ui-monospace,monospace"; ctx.fillText("TORPEDO", end.x + 6, end.y - 6);
       }
       ctx.restore();
     });
@@ -1156,12 +1194,14 @@ function GamePrototype() {
       ctx.save(); ctx.globalAlpha = coast.doomed ? .9 : .62; ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.6; ctx.setLineDash([3, 6]);
       ctx.beginPath(); coast.path.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke();
       const end = worldToScreen(coast.pos, camera); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(end.x, end.y, 4.5, 0, Math.PI * 2); ctx.stroke();
-      ctx.font = "700 7px ui-monospace,monospace"; ctx.fillText(coast.doomed ? "COAST · IMPACT" : "COAST", end.x + 7, end.y - 5); ctx.restore();
+      ctx.font = "700 10px ui-monospace,monospace"; ctx.fillText(coast.doomed ? "COAST · IMPACT" : "COAST", end.x + 7, end.y - 6); ctx.restore();
     });
   }, [worldToScreen]);
 
   const drawMissile = useCallback((ctx: CanvasRenderingContext2D, m: Missile, camera: Camera, pos: Vec, heading: number) => {
-    if (!m.alive) return; const p = worldToScreen(pos, camera); ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(heading); ctx.fillStyle = gameRef.current.settings.colors[m.player]; ctx.fillRect(-5, -2, 10, 4); ctx.beginPath(); ctx.moveTo(6, 0); ctx.lineTo(2, -4); ctx.lineTo(2, 4); ctx.closePath(); ctx.fill(); ctx.restore();
+    if (!m.alive) return; const game = gameRef.current; const p = worldToScreen(pos, camera); ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(heading); ctx.fillStyle = game.settings.colors[m.player]; ctx.fillRect(-5, -2, 10, 4); ctx.beginPath(); ctx.moveTo(6, 0); ctx.lineTo(2, -4); ctx.lineTo(2, 4); ctx.closePath(); ctx.fill(); ctx.restore();
+    const warnEnemy = (game.phase === "ready" || game.phase === "aiming") && !isCpuTurn(game) && !replayRef.current.active && m.player !== game.currentPlayer;
+    if (warnEnemy) { ctx.save(); ctx.font = "900 11px ui-monospace,monospace"; ctx.lineWidth = 4; ctx.strokeStyle = "#10171c"; ctx.strokeText("ENEMY TORPEDO", p.x + 9, p.y - 9); ctx.fillStyle = "#ffd24f"; ctx.fillText("ENEMY TORPEDO", p.x + 9, p.y - 9); ctx.restore(); }
   }, [worldToScreen]);
 
   const drawResolutionEffects = useCallback((ctx: CanvasRenderingContext2D, camera: Camera, resolution: Resolution) => {
@@ -1180,9 +1220,9 @@ function GamePrototype() {
           ctx.save(); ctx.font = "900 10px ui-monospace,monospace"; ctx.fillStyle = "#f08a64"; ctx.fillText("BASE CORE DESTROYED", p.x + 52, p.y + 4); ctx.restore();
         } else if (event.type === "rock-destroy") {
           const burstProgress = reducedMotion.current ? 1 : clamp((resolution.progress - event.phase!) / .2, 0, 1); drawBaseDestruction(ctx, p, burstProgress, 1, gameRef.current.settings.colors[event.player], .58, false);
-          ctx.save(); ctx.font = "900 9px ui-monospace,monospace"; ctx.fillStyle = "#f0a05f"; ctx.fillText(`${event.label} SHATTERED`, p.x + 34, p.y + 3); ctx.restore();
+          ctx.save(); ctx.font = "900 11px ui-monospace,monospace"; ctx.fillStyle = "#f0a05f"; ctx.fillText(`${event.label} SHATTERED`, p.x + 34, p.y + 3); ctx.restore();
         } else {
-          const burstProgress = reducedMotion.current ? 1 : clamp((resolution.progress - event.phase!) / .2, 0, 1); drawBaseDestruction(ctx, p, burstProgress, 1, gameRef.current.settings.colors[event.player], .5, false); ctx.save(); ctx.font = "800 8px ui-monospace,monospace"; ctx.fillStyle = gameRef.current.settings.colors[event.player]; ctx.fillText(`${event.label} DESTROYED`, p.x + 24, p.y + 3); ctx.restore();
+          const burstProgress = reducedMotion.current ? 1 : clamp((resolution.progress - event.phase!) / .2, 0, 1); drawBaseDestruction(ctx, p, burstProgress, 1, gameRef.current.settings.colors[event.player], .5, false); ctx.save(); ctx.font = "800 11px ui-monospace,monospace"; ctx.fillStyle = gameRef.current.settings.colors[event.player]; ctx.fillText(`${event.label} DESTROYED`, p.x + 24, p.y + 3); ctx.restore();
         }
       }
     });
@@ -1226,7 +1266,7 @@ function GamePrototype() {
     const playerColor = game.settings.colors[source.player];
     if (isUnit(source) && source.kind === "ship" && !actorHasOrder(game, source.id)) {
       const coast = predictArrival(game, source); ctx.save(); ctx.strokeStyle = game.settings.theme === "dark" ? "rgba(255,255,255,.55)" : "rgba(45,52,55,.48)"; ctx.setLineDash([3, 5]); ctx.lineWidth = 1.25; ctx.beginPath();
-      coast.path.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke(); ctx.setLineDash([]); ctx.font = "800 8px ui-monospace,monospace"; ctx.fillStyle = game.settings.theme === "dark" ? "#dce5e3" : "#4f5c61"; const end = worldToScreen(coast.pos, camera); ctx.fillText("COAST", end.x + 6, end.y - 6); ctx.restore();
+      coast.path.forEach((point, index) => { const plotted = worldToScreen(point, camera); if (index) ctx.lineTo(plotted.x, plotted.y); else ctx.moveTo(plotted.x, plotted.y); }); ctx.stroke(); ctx.setLineDash([]); ctx.font = "800 10px ui-monospace,monospace"; ctx.fillStyle = game.settings.theme === "dark" ? "#dce5e3" : "#4f5c61"; const end = worldToScreen(coast.pos, camera); ctx.fillText("COAST", end.x + 6, end.y - 6); ctx.restore();
     }
     if (game.action === "NONE") return;
     if (game.action === "LASER") {
@@ -1248,7 +1288,7 @@ function GamePrototype() {
       const p = worldToScreen(preview.impact, camera); const size = 11; const gap = 3.5; ctx.globalAlpha = 1; ctx.lineCap = "round";
       const mark = () => { ctx.beginPath(); [[-size,-size,-gap,-gap],[gap,gap,size,size],[size,-size,gap,-gap],[-gap,gap,-size,size]].forEach(([x1,y1,x2,y2]) => { ctx.moveTo(p.x + x1, p.y + y1); ctx.lineTo(p.x + x2, p.y + y2); }); ctx.stroke(); };
       ctx.strokeStyle = game.settings.theme === "dark" ? "#10171c" : "#343638"; ctx.lineWidth = 5; mark(); ctx.strokeStyle = "#ffd24f"; ctx.lineWidth = 2.5; mark();
-      ctx.font = "900 9px ui-monospace,monospace"; ctx.fillStyle = game.settings.theme === "dark" ? "#ffe17e" : "#7a5a00"; ctx.fillText(game.action === "LASER" ? "AIM" : "IMPACT", p.x + 15, p.y - 13);
+      ctx.font = "900 11px ui-monospace,monospace"; ctx.fillStyle = game.settings.theme === "dark" ? "#ffe17e" : "#7a5a00"; ctx.fillText(game.action === "LASER" ? "AIM" : "IMPACT", p.x + 15, p.y - 13);
     }
     ctx.restore();
 
@@ -1297,8 +1337,8 @@ function GamePrototype() {
     const replay = interactive && replayRef.current.active;
     const resolution = interactive ? resolutionRef.current : null;
     const motionProgress = resolution ? resolutionMotionProgress(resolution) : 1;
-    const maxHistoryTurn = Math.max(1, ...gameRef.current.history.map((event) => event.turn));
-    const sceneTime = replay ? replayRef.current.progress * maxHistoryTurn * INTERVAL : resolution ? lerp(gameRef.current.time, resolution.game.time, motionProgress) : gameRef.current.time;
+    const maxHistoryTurn = Math.max(1, ...gameRef.current.history.map((event) => event.turn)); const replayTiming = replay ? replayFrame(gameRef.current, replayRef.current.progress) : null;
+    const sceneTime = replayTiming ? ((replayTiming.turn - 1) + replayTiming.motionLocal) * INTERVAL : resolution ? lerp(gameRef.current.time, resolution.game.time, motionProgress) : gameRef.current.time;
     const isDead = (kind: TimedDeath["kind"], id: string) => Boolean(resolution?.deaths.some((death) => death.kind === kind && death.id === id && death.at <= resolution.progress));
     const isBorn = (kind: TimedBirth["kind"], id: string) => !resolution || !resolution.births.some((birth) => birth.kind === kind && birth.id === id) || resolution.births.some((birth) => birth.kind === kind && birth.id === id && birth.at <= resolution.progress);
     const visualArmor = (unit: Unit) => resolution?.damage.filter((hit) => hit.id === unit.id && hit.at <= resolution.progress).at(-1)?.armor ?? gameRef.current.units.find((original) => original.id === unit.id)?.armor ?? unit.armor;
@@ -1307,11 +1347,11 @@ function GamePrototype() {
     drawGrid(ctx, camera); drawHistory(ctx, camera, mode); drawBodies(ctx, camera, sceneTime, visualAsteroids);
     if (replay) {
       const initial = createGame(gameRef.current.settings, "ready", gameRef.current.matchSeed); initial.units.filter((unit) => unit.kind === "base" && !gameRef.current.history.some((event) => event.type === "destroy" && event.label === unit.label && event.turn - 1 + (event.phase ?? 0) <= replayTurn)).forEach((base) => {
-        const status = gameRef.current.history.filter((event): event is BaseStatusEvent => event.type === "base-status" && event.baseId === base.id && event.turn <= replayTurn).at(-1);
+        const status = gameRef.current.history.filter((event): event is BaseStatusEvent => event.type === "base-status" && event.baseId === base.id && historyEventTime(event) <= replayTurn).at(-1);
         const initialArmors = initial.units.filter((ship) => ship.kind === "ship" && ship.baseId === base.id).map((ship) => ship.armor);
         drawUnit(ctx, { ...base, armor: status?.baseArmor ?? base.armor }, camera, base.pos, base.heading, false, status?.shipArmors ?? initialArmors);
       });
-      drawReplayMarkers(ctx, camera); return;
+      drawReplayMarkers(ctx, camera); drawReplayEffects(ctx, camera); if (interactive) drawMinimap(ctx, camera, sceneTime, visualAsteroids); return;
     }
     if (resolution) resolution.tracks.forEach((points, id) => {
       const sample = points.slice(0, Math.max(2, Math.ceil(points.length * motionProgress))); if (sample.length < 2) return;
@@ -1319,13 +1359,19 @@ function GamePrototype() {
     });
     if (interactive && !resolution) drawCoastPredictions(ctx, camera);
     const units = resolution ? resolution.game.units : gameRef.current.units;
-    units.forEach((u) => { const original = gameRef.current.units.find((unit) => unit.id === u.id); const visible = resolution ? !isDead("unit", u.id) && (isTargetable(u) || Boolean(original && isTargetable(original))) : isTargetable(u); if (visible) drawUnit(ctx, { ...u, alive: true, armor: visualArmor(u) }, camera, interactive ? animatedPosition(u.id, u.pos) : u.pos, interactive ? animatedHeading(u.id, u.heading) : u.heading, mode === "history"); });
+    units.forEach((u) => {
+      const original = gameRef.current.units.find((unit) => unit.id === u.id); const visible = resolution ? !isDead("unit", u.id) && (isTargetable(u) || Boolean(original && isTargetable(original))) : isTargetable(u); if (!visible) return;
+      const timedBaseStatus = resolution && u.kind === "base" ? resolution.game.history.filter((event): event is BaseStatusEvent => event.type === "base-status" && event.baseId === u.id && event.turn === resolution.game.turn && (event.phase ?? 1) <= resolution.progress).at(-1) : undefined;
+      const storedArmors = resolution && u.kind === "base" ? timedBaseStatus?.shipArmors ?? gameRef.current.units.filter((ship) => ship.kind === "ship" && ship.alive && !ship.deployed && ship.baseId === u.id).map((ship) => ship.armor) : undefined;
+      const muted = mode === "history" && gameRef.current.phase !== "gameover";
+      drawUnit(ctx, { ...u, alive: true, armor: visualArmor(u) }, camera, interactive ? animatedPosition(u.id, u.pos) : u.pos, interactive ? animatedHeading(u.id, u.heading) : u.heading, muted, storedArmors);
+    });
     if (interactive && !resolution) { drawPlannedGhosts(ctx, camera); drawDraftWeapons(ctx, camera); }
     const missiles = resolution ? resolution.game.missiles : gameRef.current.missiles;
     missiles.forEach((m) => { const original = gameRef.current.missiles.find((missile) => missile.id === m.id); const visible = resolution ? isBorn("torpedo", m.id) && !isDead("torpedo", m.id) && (m.alive || Boolean(original?.alive)) : m.alive; if (visible) drawMissile(ctx, { ...m, alive: true }, camera, interactive ? animatedPosition(m.id, m.pos) : m.pos, interactive ? animatedHeading(m.id, Math.atan2(m.vel.y, m.vel.x)) : Math.atan2(m.vel.y, m.vel.x)); });
     if (resolution) drawResolutionEffects(ctx, camera, resolution);
     if (interactive) { drawAim(ctx, camera); drawIndicators(ctx, camera); drawMinimap(ctx, camera, sceneTime, visualAsteroids); }
-  }, [animatedHeading, animatedPosition, drawAim, drawBodies, drawCoastPredictions, drawDraftWeapons, drawGrid, drawHistory, drawIndicators, drawMinimap, drawMissile, drawPlannedGhosts, drawReplayMarkers, drawResolutionEffects, drawUnit, worldToScreen]);
+  }, [animatedHeading, animatedPosition, drawAim, drawBodies, drawCoastPredictions, drawDraftWeapons, drawGrid, drawHistory, drawIndicators, drawMinimap, drawMissile, drawPlannedGhosts, drawReplayEffects, drawReplayMarkers, drawResolutionEffects, drawUnit, worldToScreen]);
 
   const syncPaletteAnchor = useCallback(() => {
     const palette = paletteRef.current; if (!palette) return;
@@ -1382,6 +1428,11 @@ function GamePrototype() {
     const root = document.documentElement; const previous = root.style.fontSize; root.style.fontSize = `${16 * UI_SCALE_VALUES[uiScale]}px`;
     return () => { root.style.fontSize = previous; };
   }, [uiScale]);
+  useEffect(() => {
+    if (reducedMotion.current || gameView.phase !== "ready" || isCpuTurn(gameRef.current) || !planningActors(gameRef.current, gameView.currentPlayer).some((actor) => !actorHasOrder(gameRef.current, actor.id))) return;
+    const timer = window.setInterval(draw, 84);
+    return () => window.clearInterval(timer);
+  }, [draw, gameView.currentPlayer, gameView.pendingOrders.length, gameView.phase]);
 
   const setPlottedVector = useCallback((angle: number, nextPower: number, announcement?: string) => {
     const plottedPower = clamp(nextPower, .06, 1); const aim = aimRef.current;
@@ -1417,10 +1468,11 @@ function GamePrototype() {
     const next = resolution.game;
     resolution.tracks.forEach((points, id) => {
       if (points.length < 2) return; const missile = next.missiles.find((m) => m.id === id); const unit = next.units.find((u) => u.id === id); const player = missile?.player ?? unit?.player;
-      if (player !== undefined) next.history.push({ type: "path", objectKind: missile ? "torpedo" : "ship", objectId: id, player, turn: next.turn, points });
+      const death = resolution.deaths.find((candidate) => candidate.id === id && candidate.kind === (missile ? "torpedo" : "unit"));
+      if (player !== undefined) next.history.push({ type: "path", objectKind: missile ? "torpedo" : "ship", objectId: id, player, turn: next.turn, points, lead: resolution.lead, endPhase: death?.at });
     });
     next.units.filter((unit) => unit.kind === "base").forEach((base) => {
-      next.history.push({ type: "base-status", player: base.player, baseId: base.id, turn: next.turn, pos: cloneVec(base.pos), baseArmor: base.armor, shipArmors: next.units.filter((ship) => ship.kind === "ship" && ship.alive && !ship.deployed && ship.baseId === base.id).map((ship) => ship.armor) });
+      next.history.push({ type: "base-status", player: base.player, baseId: base.id, turn: next.turn, pos: cloneVec(base.pos), baseArmor: base.armor, shipArmors: next.units.filter((ship) => ship.kind === "ship" && ship.alive && !ship.deployed && ship.baseId === base.id).map((ship) => ship.armor), phase: 1 });
     });
     const outcome = findOutcome(next); next.winner = outcome.winner; next.draw = outcome.draw;
     if (next.winner !== null || next.draw) {
@@ -1452,11 +1504,13 @@ function GamePrototype() {
     const events: HistoryEvent[] = []; const effects: TimedEffect[] = []; const deaths: TimedDeath[] = []; const damage: TimedDamage[] = [];
     const births: TimedBirth[] = [];
     const addEffect = (event: TimedEffect["event"], at: number) => { const timed = { ...event, phase: at } as TimedEffect["event"]; events.push(timed); effects.push({ event: timed, at }); };
+    const recordBaseStatus = (base: Unit, at: number) => events.push({ type: "base-status", player: base.player, baseId: base.id, turn: working.turn, pos: cloneVec(base.pos), baseArmor: base.armor, shipArmors: working.units.filter((ship) => ship.kind === "ship" && ship.alive && !ship.deployed && ship.baseId === base.id).map((ship) => ship.armor), phase: at });
     const destroyAt = (id: string, kind: TimedDeath["kind"], at: number) => { if (!deaths.some((death) => death.id === id && death.kind === kind)) deaths.push({ id, kind, at }); };
     const damageTarget = (target: Unit, attacker: number, pos: Vec, amount: number, label: string, at: number) => {
       const eventStart = events.length; const killed = applyDamage(working, target, attacker, events, pos, amount, label);
       events.slice(eventStart).forEach((event) => { if (event.type === "impact" || event.type === "destroy" || event.type === "rock-destroy") { event.phase = at; effects.push({ event, at }); } });
       events.push({ type: "damage", player: target.player, turn: working.turn, pos: cloneVec(target.pos), id: target.id, armor: target.armor, objectKind: target.kind, phase: at });
+      if (target.kind === "base") recordBaseStatus(target, at);
       damage.push({ id: target.id, armor: target.armor, at }); if (killed) destroyAt(target.id, "unit", at); return killed;
     };
     const damageRock = (id: string, attacker: number, pos: Vec, label: string, at: number) => {
@@ -1505,7 +1559,7 @@ function GamePrototype() {
       const unit = working.units.find((candidate) => candidate.id === order.sourceId && isTargetable(candidate)); if (!unit) return;
       if (order.action === "DEPLOY" && unit.kind === "base") {
         const reserve = healthiestReserveFor(working, unit.player, unit.id); if (!reserve) return; const dir = unitVec(order.vector); const deployedHp = reserve.armor;
-        reserve.deployed = true; reserve.pos = add(unit.pos, mul(dir, unit.r + reserve.r + 8)); reserve.vel = cloneVec(order.vector); reserve.heading = Math.atan2(order.vector.y, order.vector.x); unit.armor = Math.max(1, unit.armor - deployedHp); damage.push({ id: unit.id, armor: unit.armor, at: 0 });
+        reserve.deployed = true; reserve.pos = add(unit.pos, mul(dir, unit.r + reserve.r + 8)); reserve.vel = cloneVec(order.vector); reserve.heading = Math.atan2(order.vector.y, order.vector.x); unit.armor = Math.max(1, unit.armor - deployedHp); damage.push({ id: unit.id, armor: unit.armor, at: 0 }); recordBaseStatus(unit, 0);
         working.log.unshift(`${reserve.label} deployed from ${unit.label}. Base HP is now ${unit.armor}.`);
       } else if (order.action === "THRUST" && unit.kind === "ship") {
         unit.vel = add(unit.vel, order.vector); unit.heading = Math.atan2(unit.vel.y, unit.vel.x); working.log.unshift(`${unit.label} applied Δv ${mag(order.vector).toFixed(1)}.`);
@@ -1519,7 +1573,12 @@ function GamePrototype() {
     working.pendingOrders.filter((order) => order.action !== "NONE").forEach((order) => events.push({ type: "marker", player: order.player, turn: working.turn, pos: cloneVec(order.markerPos), label: order.action }));
     const hasLaser = working.pendingOrders.some((order) => order.action === "LASER");
     const lead = hasLaser ? .3 : 0;
+    events.push({ type: "turn-timing", player: working.initiative, turn: working.turn, lead });
     const timelineAt = (physicsProgress: number) => lead + clamp(physicsProgress, 0, 1) * (1 - lead);
+    const tracks = new Map<string, Vec[]>();
+    const shipMovesThisTurn = (u: Unit) => u.kind === "ship" && u.alive && u.deployed;
+    working.units.filter(shipMovesThisTurn).forEach((u) => tracks.set(u.id, [cloneVec(u.pos)]));
+    working.missiles.filter((m) => m.alive).forEach((m) => tracks.set(m.id, [cloneVec(m.pos)]));
     const initiativeOrder = Array.from({ length: COMMANDER_COUNT }, (_, index) => (working.initiative + index) % COMMANDER_COUNT);
     const laserQueues = initiativeOrder.map((player) => working.pendingOrders.filter((order) => order.action === "LASER" && order.player === player));
     const lasers: PendingOrder[] = []; for (let i = 0; i < Math.max(0, ...laserQueues.map((queue) => queue.length)); i += 1) laserQueues.forEach((queue) => { if (queue[i]) lasers.push(queue[i]); });
@@ -1533,10 +1592,13 @@ function GamePrototype() {
       else working.log.unshift(`${laserSource.label} fired laser and missed.`);
     });
 
-    const tracks = new Map<string, Vec[]>();
-    const shipMovesThisTurn = (u: Unit) => u.kind === "ship" && u.alive && u.deployed;
-    working.units.filter(shipMovesThisTurn).forEach((u) => tracks.set(u.id, [cloneVec(u.pos)]));
-    working.missiles.filter((m) => m.alive).forEach((m) => tracks.set(m.id, [cloneVec(m.pos)]));
+    // Preserve a one-frame body record for anything destroyed during the laser
+    // lead-in, so replay can hide the victim immediately before its explosion.
+    tracks.forEach((points, id) => {
+      const unit = working.units.find((candidate) => candidate.id === id); const missile = working.missiles.find((candidate) => candidate.id === id);
+      if ((unit && !unit.alive) || (missile && !missile.alive)) points.push(cloneVec(points[0]));
+    });
+
     const asteroidHits = new Set<string>();
     const laserOutcome = findOutcome(working);
     for (let step = 0; step < STEPS && laserOutcome.winner === null && !laserOutcome.draw; step += 1) {
@@ -1826,11 +1888,11 @@ function GamePrototype() {
   }, [bump, clampCamera, commitKeyboard, computeTelemetry, draw, fitBattlefield, power, setAction, setPlottedVector, setSelected]);
 
   const startBattle = useCallback(() => {
-    window.clearTimeout(resolutionTimeoutRef.current); window.clearTimeout(cpuTimerRef.current); window.clearTimeout(cpuCommitTimerRef.current); window.clearTimeout(cpuWatchdogTimerRef.current); cpuThinkingRef.current = false; cancelAnimationFrame(rafRef.current); gameRef.current = createGame({ ...settingsDraft, actionsPerCommander: 1, colors: [...settingsDraft.colors], controllers: [...settingsDraft.controllers] }, "ready", generateMatchSeed()); resolutionRef.current = null; replayRef.current.active = false; aimRef.current.raw = { x: 1, y: 0 }; aimRef.current.power = .45; setPower(.45); setViewMode("tactical"); setReplayActive(false); setGameoverMinimized(false); setPaletteOpen(false); moveCameraTo(commanderCamera(gameRef.current, 0), false); computeTelemetry(aimRef.current.raw, .45); setLiveMessage(`Match seed ${String(gameRef.current.matchSeed).padStart(6, "0")}. Commander 1 has initiative. Ships coast and the base takes no action until assigned orders; edit plans, then commit all actions.`); bump(); draw();
+    window.clearTimeout(resolutionTimeoutRef.current); window.clearTimeout(cpuTimerRef.current); window.clearTimeout(cpuCommitTimerRef.current); window.clearTimeout(cpuWatchdogTimerRef.current); cpuThinkingRef.current = false; cancelAnimationFrame(rafRef.current); gameRef.current = createGame({ ...settingsDraft, actionsPerCommander: 1, colors: [...settingsDraft.colors], controllers: [...settingsDraft.controllers], fleetSizes: [...settingsDraft.fleetSizes] }, "ready", generateMatchSeed()); resolutionRef.current = null; replayRef.current.active = false; aimRef.current.raw = { x: 1, y: 0 }; aimRef.current.power = .45; setPower(.45); setViewMode("tactical"); setReplayActive(false); setGameoverMinimized(false); setPaletteOpen(false); moveCameraTo(commanderCamera(gameRef.current, 0), false); computeTelemetry(aimRef.current.raw, .45); setLiveMessage(`Match seed ${String(gameRef.current.matchSeed).padStart(6, "0")}. Commander 1 has initiative. Every visible asset is ready for one plan; edit any plans, then commit all actions.`); bump(); draw();
   }, [bump, commanderCamera, computeTelemetry, draw, moveCameraTo, settingsDraft]);
 
   const resetToSetup = useCallback(() => {
-    window.clearTimeout(resolutionTimeoutRef.current); window.clearTimeout(cpuTimerRef.current); window.clearTimeout(cpuCommitTimerRef.current); window.clearTimeout(cpuWatchdogTimerRef.current); cpuThinkingRef.current = false; cancelAnimationFrame(rafRef.current); cancelAnimationFrame(cameraRafRef.current); setSettingsDraft({ ...gameRef.current.settings, actionsPerCommander: 1, colors: [...gameRef.current.settings.colors], controllers: [...gameRef.current.settings.controllers] }); gameRef.current = createGame(gameRef.current.settings, "setup"); resolutionRef.current = null; replayRef.current.active = false; aimRef.current.raw = { x: 1, y: 0 }; aimRef.current.power = .45; setPower(.45); setViewMode("tactical"); setReplayActive(false); setGameoverMinimized(false); setPaletteOpen(false); cameraRef.current = { x: CENTRAL.x, y: CENTRAL.y, zoom: defaultZoom() }; clampCamera(cameraRef.current); setLiveMessage("Choose the two commanders."); bump(); draw();
+    window.clearTimeout(resolutionTimeoutRef.current); window.clearTimeout(cpuTimerRef.current); window.clearTimeout(cpuCommitTimerRef.current); window.clearTimeout(cpuWatchdogTimerRef.current); cpuThinkingRef.current = false; cancelAnimationFrame(rafRef.current); cancelAnimationFrame(cameraRafRef.current); setSettingsDraft({ ...gameRef.current.settings, actionsPerCommander: 1, colors: [...gameRef.current.settings.colors], controllers: [...gameRef.current.settings.controllers], fleetSizes: [...gameRef.current.settings.fleetSizes] }); gameRef.current = createGame(gameRef.current.settings, "setup"); resolutionRef.current = null; replayRef.current.active = false; aimRef.current.raw = { x: 1, y: 0 }; aimRef.current.power = .45; setPower(.45); setViewMode("tactical"); setReplayActive(false); setGameoverMinimized(false); setPaletteOpen(false); cameraRef.current = { x: CENTRAL.x, y: CENTRAL.y, zoom: defaultZoom() }; clampCamera(cameraRef.current); setLiveMessage("Choose the two commanders."); bump(); draw();
   }, [bump, clampCamera, defaultZoom, draw]);
 
   const restart = useCallback(() => {
@@ -1844,7 +1906,7 @@ function GamePrototype() {
 
   const startReplay = useCallback(() => {
     if (!gameRef.current.history.length) { setLiveMessage("There is no battle history to replay yet."); return; }
-    cancelAnimationFrame(rafRef.current); const turns = Math.max(1, ...gameRef.current.history.map((event) => event.turn)); const duration = reducedMotion.current ? 900 : clamp(turns * 1400, 7000, 24000);
+    cancelAnimationFrame(rafRef.current); const turns = Math.max(1, ...gameRef.current.history.map((event) => event.turn)); const duration = reducedMotion.current ? 900 : clamp(turns * 1150, 7000, 60000);
     replayRef.current = { active: true, progress: 0, started: performance.now(), duration }; setReplayActive(true); setGameoverMinimized(true); setViewMode("history"); moveCameraTo(engagementCamera(gameRef.current, true, [], true)); setLiveMessage("Battle replay started.");
     const animateReplay = (now: number) => {
       const replay = replayRef.current; if (!replay.active) return; replay.progress = clamp((now - replay.started) / replay.duration, 0, 1); draw();
@@ -1903,7 +1965,8 @@ function GamePrototype() {
   const displayColors = game.phase === "setup" ? settingsDraft.colors : game.settings.colors;
   const shellStyle = { "--p1": displayColors[0], "--p2": displayColors[1], "--commander": game.phase === "setup" ? displayColors[0] : displayColors[game.currentPlayer], "--ui-scale": UI_SCALE_VALUES[uiScale] } as CSSProperties;
   const actionSlots = playerIds().reduce((sum, player) => sum + planningActors(game, player).length, 0);
-  const currentActors = planningActors(game, game.currentPlayer); const defaultActors = currentActors.filter((actor) => !actorHasActivePlan(game, actor.id));
+  const currentActors = planningActors(game, game.currentPlayer); const readyActors = currentActors.filter((actor) => !actorHasOrder(game, actor.id));
+  const planLabelFor = (actor: Unit) => { const draft = draftForActor(game, actor.id); return !draft ? "READY FOR ORDERS" : draft.action === "NONE" ? actor.kind === "base" ? "NO ACTION PLANNED" : "COAST PLANNED" : `${actionLabel(draft.action, actor)} PLANNED`; };
   const matchStats = {
     lasers: game.history.filter((event) => event.type === "marker" && event.label === "LASER").length,
     torpedoes: game.history.filter((event) => event.type === "marker" && event.label === "TORPEDO").length,
@@ -1919,13 +1982,13 @@ function GamePrototype() {
       <a className="skip-link" href="#command-deck">Skip to command controls</a>
       <header className="topbar">
         <div className="brand"><p>Proctor Creative</p><h1>GRAPHITE_FLEET <span className="prototype-tag">{"// SPACE BATTLE"}</span></h1></div>
-        <div className="turn-readout" aria-live="polite"><span>{game.phase === "setup" ? "FLEET RULES · MATCH SETUP" : `ROUND ${String(game.turn).padStart(2, "0")} · ${game.pendingOrders.filter((order) => order.action !== "NONE").length}/${actionSlots} ACTIVE PLANS · ${game.phase.toUpperCase()} · SEED ${String(game.matchSeed).padStart(6, "0")}`}</span><strong style={{ color: game.settings.colors[game.currentPlayer] }}>{game.phase === "setup" ? "CHOOSE COMMANDERS" : `COMMANDER ${game.currentPlayer + 1} · ${controllerFor(game, game.currentPlayer).toUpperCase()} · ${defaultActors.length} IDLE · SHIPS ${aliveShips.join("—")}`}</strong></div>
+        <div className="turn-readout" aria-live="polite"><span>{game.phase === "setup" ? "FLEET RULES · MATCH SETUP" : `ROUND ${String(game.turn).padStart(2, "0")} · ${game.pendingOrders.length}/${actionSlots} PLANS · ${game.phase.toUpperCase()} · SEED ${String(game.matchSeed).padStart(6, "0")}`}</span><strong style={{ color: game.settings.colors[game.currentPlayer] }}>{game.phase === "setup" ? "CHOOSE COMMANDERS" : `COMMANDER ${game.currentPlayer + 1} · ${controllerFor(game, game.currentPlayer).toUpperCase()} · ${readyActors.length} READY FOR ORDERS · SHIPS ${aliveShips.join("—")}`}</strong></div>
       </header>
 
       <section className="game-layout">
         <div className="battlefield-wrap" ref={wrapRef}>
           <canvas ref={canvasRef} className="battlefield" tabIndex={0}
-            aria-label={`Graphite Fleet battlefield with ${game.asteroids.filter((asteroid) => asteroid.alive).length} destructible asteroids orbiting the central planet. Round ${game.turn}; ${game.pendingOrders.filter((order) => order.action !== "NONE").length} active draft plans. Commander ${game.currentPlayer + 1}, ${sourceLabel(selected)} selected, ${game.action} planned. Vector ${vectorDescription(vectorView, power)}.${telemetry.impact ? game.action === "LASER" ? " A yellow X marks the centerline aim contact; laser scatter remains hidden." : " Impact predicted; a yellow X marks the collision point." : ""} ${defaultActors.length} assets are idle.`}
+            aria-label={`Graphite Fleet battlefield with ${game.asteroids.filter((asteroid) => asteroid.alive).length} destructible asteroids orbiting the central planet. Round ${game.turn}; ${game.pendingOrders.length} editable plans. Commander ${game.currentPlayer + 1}, ${sourceLabel(selected)} selected, ${game.action} planned. Vector ${vectorDescription(vectorView, power)}.${telemetry.impact ? game.action === "LASER" ? " A yellow X marks the centerline aim contact; laser scatter remains hidden." : " Impact predicted; a yellow X marks the collision point." : ""} ${readyActors.length} assets are ready for orders.`}
             aria-describedby="canvas-help" onPointerDown={onPointerDown} onPointerMove={onPointerMove}
             onPointerUp={(e) => endPointer(e)} onPointerCancel={(e) => endPointer(e, true)}
             onWheel={onWheel} onKeyDown={onKeyDown} onContextMenu={(e) => e.preventDefault()} />
@@ -1941,7 +2004,7 @@ function GamePrototype() {
                 else { setPaletteOpen(false); setLiveMessage(`${selectedUnit.label} plan left unchanged.`); }
               }}><span>{option.label}</span>{option.reason && <span className="disabled-mark" aria-hidden="true">×</span>}</button>)}
           </div>}
-          <p className="visually-hidden" id="canvas-help">Select a different asset to open its radial action palette. Press and release the already-selected asset without dragging to reopen that palette; drag it to plot its vector directly. Unassigned ships coast and unassigned bases take no action. Draft results remain editable until Commit All Actions. Dashed yellow rings mark idle assets; green rings mark active draft plans. A yellow X marks a predicted movement impact or the centerline aim contact for a laser; laser scatter remains hidden until resolution. Empty-space drag pans and two-finger gestures pan or zoom. Key 0 chooses coast or no action. Keys 1 through 4 declare thrust, torpedo, laser, and deploy. Arrow keys adjust the vector; hold Shift for fine adjustment. Left and right bracket cycle objects. Space or Enter commits all actions. W A S D pan. Plus and minus zoom. F fits the battlefield. H toggles history.</p>
+          <p className="visually-hidden" id="canvas-help">Select a different asset to open its radial action palette. Press and release the already-selected asset without dragging to reopen that palette; drag it to plot its vector directly. Every visible asset is ready for one editable plan. Untouched ships coast and untouched bases take no action when all plans are committed. Pulsing dashed yellow rings mark assets ready for orders; green rings mark assigned plans, including coast and no action. A yellow X marks a predicted movement impact or the centerline aim contact for a laser; laser scatter remains hidden until resolution. Empty-space drag pans and two-finger gestures pan or zoom. Key 0 chooses coast or no action. Keys 1 through 4 declare thrust, torpedo, laser, and deploy. Arrow keys adjust the vector; hold Shift for fine adjustment. Left and right bracket cycle objects. Space or Enter commits all actions. W A S D pan. Plus and minus zoom. F fits the battlefield. H toggles history.</p>
           <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">{liveMessage}</div>
           {game.phase === "resolving" && <div className="resolve-banner">Universe advancing · 6 seconds</div>}
           {cpuTurn && <div className="cpu-banner" role="status">CPU Commander plotting</div>}
@@ -1952,20 +2015,24 @@ function GamePrototype() {
         <aside className="command-deck" id="command-deck" aria-label="Command deck">
           <section className="deck-section command-section">
             <div className="command-left">
-              <p className="eyebrow">Selected object</p><div className="selected-title"><h2>{sourceLabel(selected)}</h2><span>{selectedUnit ? `${selectedUnit.kind.toUpperCase()} · ${actorHasActivePlan(game, selectedUnit.id) ? "ACTIVE DRAFT" : selectedUnit.kind === "ship" ? "COAST" : "NO ACTION"} · ${selectedUnit.kind === "base" ? reserveShipsFor(game, selectedUnit.player, selectedUnit.id).length : reserveShips[game.currentPlayer]} RESERVE` : `TORPEDO · COMMANDED BY ${actorForSource(game, selected)?.label ?? "LOST SHIP"}`}</span></div>
+              <p className="eyebrow">Selected object</p><div className="selected-title"><h2>{sourceLabel(selected)}</h2><span>{selectedUnit ? `${selectedUnit.kind.toUpperCase()} · ${planLabelFor(selectedUnit)} · ${selectedUnit.kind === "base" ? reserveShipsFor(game, selectedUnit.player, selectedUnit.id).length : reserveShips[game.currentPlayer]} RESERVE` : `TORPEDO · COMMANDED BY ${actorForSource(game, selected)?.label ?? "LOST SHIP"}`}</span></div>
               <div className="resource-grid">
                 <div><span>Stored velocity</span><strong>{mag(selected.vel).toFixed(1)} u/s</strong></div>
-                {selectedUnit ? <><div><span>{selectedUnit.kind === "base" ? "Base HP" : "Ship HP"}</span><strong>{selectedUnit.kind === "base" ? `${selectedUnit.armor}/${BASE_STARTING_HP}` : `${selectedUnit.armor}/3`}</strong></div><div><span>{selectedUnit.kind === "base" ? "Ships inside" : "Torpedoes"}</span><strong>{selectedUnit.kind === "base" ? reserveShipsFor(game, selectedUnit.player, selectedUnit.id).length : selectedUnit.missiles}</strong></div><div><span>Laser</span><strong>{selectedUnit.kind === "base" ? `${BASE_LASER_MAX} U MAX` : `${Math.round(SHIP_LASER_MAX)} U MAX`}</strong></div></> : <><div><span>Correction</span><strong>{selectedTorpedo?.correctionAvailable ? "READY" : "SPENT"}</strong></div><div><span>Flight time</span><strong>{selectedTorpedo?.age.toFixed(0)} s</strong></div><div><span>Status</span><strong>IN FLIGHT</strong></div></>}
+                {selectedUnit ? <><div><span>{selectedUnit.kind === "base" ? "Base HP" : "Ship HP"}</span><strong>{selectedUnit.kind === "base" ? `${selectedUnit.armor}/${baseStartingHpFor(game.settings, selectedUnit.player)}` : `${selectedUnit.armor}/3`}</strong></div><div><span>{selectedUnit.kind === "base" ? "Ships inside" : "Torpedoes"}</span><strong>{selectedUnit.kind === "base" ? reserveShipsFor(game, selectedUnit.player, selectedUnit.id).length : selectedUnit.missiles}</strong></div><div><span>Laser</span><strong>{selectedUnit.kind === "base" ? `${BASE_LASER_MAX} U MAX` : `${Math.round(SHIP_LASER_MAX)} U MAX`}</strong></div></> : <><div><span>Correction</span><strong>{selectedTorpedo?.correctionAvailable ? "READY" : "SPENT"}</strong></div><div><span>Flight time</span><strong>{selectedTorpedo?.age.toFixed(0)} s</strong></div><div><span>Status</span><strong>IN FLIGHT</strong></div></>}
               </div>
             </div>
             <div>
-              <div className="unit-tabs" aria-label="Select active unit">{unitsForPlayer.map((u) => <button key={u.id} type="button" disabled={game.phase !== "ready" || cpuTurn} title={cpuTurn ? "CPU commander is plotting" : undefined} className={u.id === selectedUnit?.id ? `active ${playerClass}` : ""} onClick={(event) => { setSelected(u.id); focusCanvasAfterPointer(event); }}>{u.label}</button>)}</div>
+              <div className="fleet-order-board" aria-label="Fleet order status">
+                <div className="fleet-order-heading"><span>Command every asset</span><strong>{readyActors.length ? `${readyActors.length} READY` : "ALL PLANNED"}</strong></div>
+                <div className="unit-tabs" aria-label="Select an asset to command">{unitsForPlayer.map((u) => <button key={u.id} type="button" disabled={game.phase !== "ready" || cpuTurn} title={cpuTurn ? "CPU commander is plotting" : planLabelFor(u)} className={`${u.id === selectedUnit?.id ? `active ${playerClass}` : ""} ${actorHasOrder(game, u.id) ? "has-plan" : "ready-orders"}`} onClick={(event) => { setSelected(u.id); focusCanvasAfterPointer(event); }}><span>{u.label}</span><small>{planLabelFor(u)}</small></button>)}</div>
+                {readyActors.length > 0 && <button className="next-ready" type="button" disabled={game.phase !== "ready" || cpuTurn} onClick={(event) => { setSelected(readyActors[0].id); focusCanvasAfterPointer(event); }}>Command next ready asset →</button>}
+              </div>
               <p className="selected-action-label">Available for <strong>{sourceLabel(selected)}</strong></p>
               <div className={`action-row ${selectedActions.length <= 2 ? "compact-actions" : ""}`}>{selectedActions.map((action) => { const reason = actionReason(action); const phaseLocked = game.phase !== "ready" || cpuTurn; const phaseReason = cpuTurn ? "CPU commander is plotting" : game.phase === "aiming" ? "vector is being edited" : "action phase is not ready"; const torpedoCount = action === "TORPEDO" && selectedUnit?.kind === "ship" ? selectedUnit.missiles : 0; const label = actionLabel(action, selected); const accessibleLabel = action === "TORPEDO" ? `${label}, ${torpedoCount} remaining` : label; return <button key={action} type="button" disabled={phaseLocked || Boolean(reason)} title={reason ?? (phaseLocked ? phaseReason : `${label} ready`)} aria-label={reason ? `${accessibleLabel} unavailable: ${reason}` : phaseLocked ? `${accessibleLabel} unavailable: ${phaseReason}` : accessibleLabel} className={game.action === action ? `active ${playerClass}` : ""} onClick={(event) => { setAction(action); focusCanvasAfterPointer(event); }}><span>{label}</span>{action === "TORPEDO" && <span className="torpedo-icons" aria-hidden="true">{Array.from({ length: torpedoCount }).map((_, index) => <i key={index}/>)}</span>}{reason && <span className="disabled-mark" aria-hidden="true">×</span>}</button>; })}</div>
               <p className="reserve-readout"><strong>{activeShips[game.currentPlayer].length} DEPLOYED</strong> · {reserveShips[game.currentPlayer]} IN RESERVE</p>
               {fleetNotice && <p className="fleet-notice" role="status">{fleetNotice}</p>}
-              {game.turn === 1 && <p className="first-turn-hint" role="note">SELECT ASSETS → EDIT PLANS → COMMIT ALL ACTIONS »</p>}
-              <p className={`action-status ${cpuTurn ? "cpu" : declaredActionReason ? "unavailable" : telemetry.impact && game.action !== "NONE" && game.action !== "LASER" ? "impact-warning" : "ready"}`} aria-live="polite">{cpuTurn ? "CPU COMMANDER IS PLOTTING" : game.action === "NONE" ? `✓ ${actionLabel(game.action, selected)} — safe idle plan` : game.phase === "aiming" ? `↗ Editing ${game.action} vector — release to update the draft` : declaredActionReason ? `× ${game.action} unavailable — ${declaredActionReason}` : game.action === "LASER" && telemetry.impact ? "✓ LASER aim contact marked — scatter remains hidden until resolution" : telemetry.impact ? `× IMPACT PREDICTED — revise this editable draft or keep it` : `✓ ${game.action} planned — editable until Commit All Actions`}</p>
+              {game.turn === 1 && <p className="first-turn-hint" role="note">EACH VISIBLE ASSET GETS ONE PLAN · {readyActors.length} READY »</p>}
+              <p className={`action-status ${cpuTurn ? "cpu" : declaredActionReason ? "unavailable" : telemetry.impact && game.action !== "NONE" && game.action !== "LASER" ? "impact-warning" : "ready"}`} aria-live="polite">{cpuTurn ? "CPU COMMANDER IS PLOTTING" : game.action === "NONE" ? actorHasOrder(game, selectedUnit?.id ?? "") ? `✓ ${actionLabel(game.action, selected)} planned` : `○ ${sourceLabel(selected)} is ready for orders` : game.phase === "aiming" ? `↗ Editing ${game.action} vector — release to update the draft` : declaredActionReason ? `× ${game.action} unavailable — ${declaredActionReason}` : game.action === "LASER" && telemetry.impact ? "✓ LASER aim contact marked — scatter remains hidden until resolution" : telemetry.impact ? `× IMPACT PREDICTED — revise this editable draft or keep it` : `✓ ${game.action} planned — editable until Commit All Actions`}</p>
 
               <details className="vector-plotter">
                 <summary>Direct vector plotter</summary>
@@ -1988,7 +2055,7 @@ function GamePrototype() {
                 </div>
                 </fieldset>
               </details>
-              <div className="commit-row"><button className={`commit-button master-commit ${needsCommit ? "needs-commit" : ""}`} type="button" disabled={game.phase !== "ready" || cpuTurn} title={cpuTurn ? "CPU commander is plotting" : "Seal every editable draft and pass command or resolve the round"} onClick={commitKeyboard}>Commit All Actions »</button><button type="button" disabled={game.phase !== "ready" || cpuTurn || game.action === "NONE"} onClick={() => updateVectorFromControls(vectorAngleDegrees(isUnit(selected) ? { x: Math.cos(selected.heading), y: Math.sin(selected.heading) } : selected.vel), .45, true)}>Reset vector</button></div>
+              <div className="commit-row"><button className={`commit-button master-commit ${needsCommit ? "needs-commit" : ""}`} type="button" disabled={game.phase !== "ready" || cpuTurn} title={cpuTurn ? "CPU commander is plotting" : "Seal every editable draft and pass command or resolve the round"} onClick={commitKeyboard}>{readyActors.length ? `Commit All · ${readyActors.length} Ready »` : "Commit All Actions »"}</button><button type="button" disabled={game.phase !== "ready" || cpuTurn || game.action === "NONE"} onClick={() => updateVectorFromControls(vectorAngleDegrees(isUnit(selected) ? { x: Math.cos(selected.heading), y: Math.sin(selected.heading) } : selected.vel), .45, true)}>Reset vector</button></div>
             </div>
           </section>
 
@@ -2020,7 +2087,7 @@ function GamePrototype() {
         <div className="setup-card">
           <p className="eyebrow">Fleet Rules · Match setup</p>
           <h2 id="setup-title">Graphite Fleet</h2>
-          <p id="setup-description" className="setup-description">Choose who commands each of the two opposing fleets. Every commander controls one base with six ships; gravity, persistent inertia, sealed orders, and last-asset-standing victory are always active.</p>
+          <p id="setup-description" className="setup-description">Choose who commands the two opposing fleets and set each base to carry one through six ships. Unequal fleets create a built-in handicap; gravity, persistent inertia, sealed orders, and last-asset-standing victory are always active.</p>
           <p className="game-credit">Graphite Fleet is an open source adaptation, inspired by a traditional pencil-and-paper space-combat game passed between classrooms and friends, professors and students. <strong>Thank you, Professor A.</strong></p>
 
           <div className="commander-roster">
@@ -2028,6 +2095,7 @@ function GamePrototype() {
               <div className="seat-controller" aria-label={`Commander ${player + 1} controller`}>
                 {(["human", "cpu"] as ControllerKind[]).map((controller) => <button key={controller} autoFocus={player === 0 && controller === "human"} type="button" aria-pressed={setupControllers[player] === controller} className={setupControllers[player] === controller ? "active" : ""} onClick={() => setSettingsDraft((settings) => { const controllers = controllersForCommanders(settings.controllers); controllers[player] = controller; return { ...settings, controllers }; })}>{controller}</button>)}
               </div>
+              <div className="fleet-size-control"><span>Ships in base</span><div role="group" aria-label={`Commander ${player + 1} starting ships`}>{Array.from({ length: MAX_FLEET_SIZE }, (_, index) => index + 1).map((count) => <button key={count} type="button" aria-pressed={settingsDraft.fleetSizes[player] === count} className={settingsDraft.fleetSizes[player] === count ? "active" : ""} onClick={() => setSettingsDraft((settings) => { const fleetSizes = fleetSizesForCommanders(settings.fleetSizes); fleetSizes[player] = count; return { ...settings, fleetSizes }; })}>{count}</button>)}</div><small>{settingsDraft.fleetSizes[player]} ships · {settingsDraft.fleetSizes[player] * 3 + 1} base HP · up to {settingsDraft.fleetSizes[player] + 1} plans</small></div>
               <div className="color-options">{COLOR_OPTIONS.map((option) => {
               const selectedColor = settingsDraft.colors[player] === option.value; const unavailable = settingsDraft.colors.some((color, owner) => owner !== player && color === option.value);
               return <button key={option.value} type="button" disabled={unavailable} aria-pressed={selectedColor} aria-label={`${option.name}${unavailable ? ", selected by another commander" : ""}`} className={selectedColor ? "color-choice active" : "color-choice"} onClick={() => setSettingsDraft((settings) => { const colors = [...settings.colors]; colors[player] = option.value; return { ...settings, colors }; })}><span className="color-swatch" style={{ backgroundColor: option.value }} aria-hidden="true"/><span>{option.name}</span></button>;
@@ -2035,8 +2103,8 @@ function GamePrototype() {
           </div>
 
           <p className="mobile-start-note">Best played on a laptop or desktop, with a friend.</p>
-          <p className="setup-note">The opposing bases begin outside one another’s laser range. Every base stores six 3-HP ships and begins with 19 HP. Lasers deal 1 HP; torpedoes and collisions deal 2 HP. The last commander with a surviving asset wins.</p>
-          <div className="setup-footer"><p><strong>ASSET COMMAND</strong><span>2 opposing commanders · 2 bases · {FLEET_SIZE} ships each</span></p><button className="start-battle" type="button" onClick={startBattle}>Begin battle</button></div>
+          <p className="setup-note">The opposing bases begin outside one another’s laser range. Each 3-HP ship stored inside its base contributes 3 base HP, plus one core HP. Lasers deal 1 HP; torpedoes and collisions deal 2 HP. The last commander with a surviving asset wins.</p>
+          <div className="setup-footer"><p><strong>{settingsDraft.fleetSizes[0] === settingsDraft.fleetSizes[1] ? "ASSET COMMAND" : "HANDICAP MATCH"}</strong><span>Commander 1: {settingsDraft.fleetSizes[0]} ships · Commander 2: {settingsDraft.fleetSizes[1]} ships</span></p><button className="start-battle" type="button" onClick={startBattle}>Begin battle</button></div>
         </div>
       </section>}
       <div className="rotate-notice" role="status"><strong>Rotate to play</strong><span>Graphite Fleet is best played on desktop or in horizontal orientation.</span></div>

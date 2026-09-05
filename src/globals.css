@@ -48,7 +48,16 @@ button { font: inherit; }
 .resource-grid span, .telemetry-grid span { display: block; color: var(--muted); font-size: .49rem; letter-spacing: .1em; text-transform: uppercase; }
 .resource-grid strong, .telemetry-grid strong { display: block; margin-top: .18rem; overflow: hidden; color: #f3f7f6; font-size: .69rem; text-overflow: ellipsis; white-space: nowrap; }
 .unit-tabs, .action-row, .utility-row { display: grid; gap: .42rem; }
+.fleet-order-board { margin-top: .15rem; padding: .48rem; border: 1px solid #3a4d55; background: rgba(255,255,255,.025); }
+.fleet-order-heading { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .4rem; color: #dbe5e3; font-size: .52rem; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+.fleet-order-heading strong { color: #ffd24f; }
 .unit-tabs { grid-template-columns: repeat(2,1fr); }
+.unit-tabs button { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: .42rem; min-width: 0; padding: .38rem .46rem; text-align: left; }
+.unit-tabs button > span { color: #f1f6f5; font-size: .58rem; }
+.unit-tabs button > small { overflow: hidden; color: #ffd24f; font-size: .43rem; letter-spacing: .04em; text-overflow: ellipsis; white-space: nowrap; }
+.unit-tabs button.has-plan > small { color: #54d77b; }
+.unit-tabs button.ready-orders { border-color: rgba(255,210,79,.72); border-style: dashed; }
+.next-ready { width: 100%; min-height: 38px; margin-top: .38rem; border-color: #ffd24f; color: #ffe17e; background: rgba(255,210,79,.07); font-size: .5rem; }
 .origin-switch { display: grid; grid-template-columns: 1fr 1fr; gap: .38rem; margin: .48rem 0 0; padding: .48rem; border: 1px dashed color-mix(in srgb,var(--cyan) 45%,transparent); }
 .origin-switch legend { padding: 0 .28rem; color: var(--cyan); font-size: .48rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
 .origin-switch small { grid-column: 1 / -1; color: var(--muted); font-size: .48rem; line-height: 1.4; }
@@ -152,6 +161,12 @@ input[type="range"]:disabled { opacity: .4; cursor: not-allowed; }
 .rule-fieldset legend { width: 100%; padding: .85rem 0 0; color: var(--cyan); font-size: .57rem; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
 .commander-roster { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; border-top: 1px solid var(--line); }
 .commander-seat { border-top: 0; }
+.fleet-size-control { display: grid; gap: .36rem; margin-top: .65rem; }
+.fleet-size-control > span { color: var(--muted); font-size: .51rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+.fleet-size-control > div { display: grid; grid-template-columns: repeat(6,1fr); }
+.fleet-size-control button { min-width: 0; min-height: 42px; padding: .35rem; }
+.fleet-size-control button + button { border-left: 0; }
+.fleet-size-control small { color: #9fb0b4; font-size: .49rem; letter-spacing: .04em; }
 .seat-controller { display: grid; grid-template-columns: 1fr 1fr; margin-top: .5rem; }
 .seat-controller button { min-height: 42px; padding: .4rem .55rem; }
 .seat-controller button + button { border-left: 0; }
